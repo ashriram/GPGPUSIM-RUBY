@@ -1,0 +1,4 @@
+2010.07.30 
+  - Fixed the bug 
+    - Location: SIM_router_stat_energy, ONE_STAGE_ARB, average number of 
+      request for the arbiter should be 2 instead of 1.

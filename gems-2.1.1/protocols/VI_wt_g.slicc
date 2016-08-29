@@ -1,0 +1,6 @@
+../protocols/VI_wt-msg.sm
+../protocols/VI_wt-L2cache.sm
+../protocols/VI_wt-L1cache.sm
+../protocols/VI_wt_g-mem.sm
+../protocols/standard_CMP-protocol.sm
+

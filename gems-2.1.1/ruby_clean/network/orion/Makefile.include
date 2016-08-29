@@ -1,0 +1,21 @@
+#Makefile.include for the orion
+ORION_VPATH := network/orion
+ORION_SRC_C = \
+	SIM_ALU.c \
+	SIM_array_l.c \
+	SIM_array_m.c \
+	SIM_cam.c \
+	SIM_clock.c \
+	SIM_link.c \
+	SIM_misc.c \
+	SIM_permu.c \
+	SIM_router.c \
+	SIM_arbiter.c \
+	SIM_crossbar.c \
+	SIM_static.c \
+	SIM_time.c \
+	SIM_util.c \
+	SIM_router_power.c \
+	SIM_router_area.c
+ORION_SRC_CPP = \
+	NetworkPowerArea.C \

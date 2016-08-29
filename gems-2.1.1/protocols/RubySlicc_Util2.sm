@@ -1,0 +1,6 @@
+void ideal_inv_all_L1s(NodeID chip_id, Address addr);
+void ideal_inv_sharer_L1s(NodeID chip_id, Address addr, NetDest Sharers);
+void ideal_inv_sharer_L1s_minus_requester(NodeID chip_id, Address addr, NetDest Sharers, MachineID requester);
+bool protocol_is_ideal_coherence();
+bool benchmark_contains_membar();
+NetDest get_true_sharers(NodeID chip_id, Address addr);

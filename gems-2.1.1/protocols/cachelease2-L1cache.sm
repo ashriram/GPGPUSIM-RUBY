@@ -1,0 +1,795 @@
+
+/*
+    Copyright (C) 1999-2005 by Mark D. Hill and David A. Wood for the
+    Wisconsin Multifacet Project.  Contact: gems@cs.wisc.edu
+    http://www.cs.wisc.edu/gems/
+
+    --------------------------------------------------------------------
+
+    This file is part of the SLICC (Specification Language for
+    Implementing Cache Coherence), a component of the Multifacet GEMS
+    (General Execution-driven Multiprocessor Simulator) software
+    toolset originally developed at the University of Wisconsin-Madison.
+
+    SLICC was originally developed by Milo Martin with substantial
+    contributions from Daniel Sorin.
+
+    Substantial further development of Multifacet GEMS at the
+    University of Wisconsin was performed by Alaa Alameldeen, Brad
+    Beckmann, Jayaram Bobba, Ross Dickson, Dan Gibson, Pacia Harper,
+    Derek Hower, Milo Martin, Michael Marty, Carl Mauer, Michelle Moravan,
+    Kevin Moore, Manoj Plakal, Daniel Sorin, Haris Volos, Min Xu, and Luke Yen.
+
+    --------------------------------------------------------------------
+
+    If your use of this software contributes to a published paper, we
+    request that you (1) cite our summary paper that appears on our
+    website (http://www.cs.wisc.edu/gems/) and (2) e-mail a citation
+    for your published paper to gems@cs.wisc.edu.
+
+    If you redistribute derivatives of this software, we request that
+    you notify us and either (1) ask people to register with us at our
+    website (http://www.cs.wisc.edu/gems/) or (2) collect registration
+    information and periodically send it to us.
+
+    --------------------------------------------------------------------
+
+    Multifacet GEMS is free software; you can redistribute it and/or
+    modify it under the terms of version 2 of the GNU General Public
+    License as published by the Free Software Foundation.
+
+    Multifacet GEMS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the Multifacet GEMS; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+    02111-1307, USA
+
+    The GNU General Public License is contained in the file LICENSE.
+
+### END HEADER ###
+ */
+/*
+ * $Id: MSI_MOSI_CMP_directory-L1cache.sm 1.10 05/01/19 15:55:40-06:00 beckmann@s0-28.cs.wisc.edu $
+ *
+ */
+
+
+machine(L1Cache, "Cache Leasing v2 L1 Cache CMP") {
+
+    // NODE L1 CACHE
+    // From this node's L1 cache TO the network
+    // a local L1 -> this L2 bank, currently ordered with directory forwarded requests
+    MessageBuffer requestFromL1Cache, network="To", virtual_network="0", ordered="true";
+
+    // To this node's L1 cache FROM the network a L2 bank -> this L1
+    MessageBuffer responseToL1Cache, network="From", virtual_network="1", ordered="true";
+
+
+    // STATES
+    enumeration(State, desc="Cache states", default="L1Cache_State_I") {
+        // Base states
+        I, desc="a L1 cache entry Idle";
+        S, desc="a L1 cache entry Valid";
+
+        // Transient States
+        I_S, desc="L1 idle, issued GETS , have not seen response yet";
+        I_I, desc="Issued at least one write, go to I when all requests are done";
+        SM, desc="Write Upgrade sent, have not seen Data or Ack yet";
+    }
+
+    // EVENTS
+    enumeration(Event, desc="Cache events") {
+        // L1 events
+        Load,            desc="Load request from the home processor";
+        L1_WThru,        desc="Store request from the home processor";
+        L1_Atomic,       desc="Atomic request from the home processor";
+        // internal generated request
+        L1_Replacement,  desc="L1 Replacement", format="!r";
+
+
+        Data,        desc="Data response for load request. Still stores outstanding";
+        Data_Done,   desc="Data response for load request and all outstanding accesses are done";
+
+        Ack,         desc="Ack for write request. Still requests outstanding";
+        Ack_Done,    desc="Ack for write request and all outstanding accesses are done";
+
+        DataAtomic,  desc="Atomic Data for processor. Still requests outstanding";
+        DataAtomic_Done,  desc="Atomic Data for processor and all outstanding requests are done";
+    }
+
+    // TYPES
+
+    // CacheEntry
+    structure(Entry, desc="...", interface="AbstractCacheEntry" ) {
+        State CacheState,        desc="cache state";
+        DataBlock DataBlk,       desc="data for the block";
+        Time liveUntilTime,      desc="lifetime of the cache block";
+    }
+
+    // TBE fields
+    structure(TBE, desc="...") {
+        Address Address,              desc="Physical address for this TBE";
+        State TBEState,        desc="Transient state";
+        DataBlock DataBlk,                desc="Buffer for the data block";
+        bool isPrefetch,       desc="Set if this was caused by a prefetch";
+        int pendingAcks, default="0", desc="number of pending acks";
+        MemorySpaceType Space,        desc="Memory space of request (GLOBAL, LOCAL)";
+        int ThreadID,            desc="The SMT thread that initiated this request";
+        Time liveUntilTime,      desc="lifetime of the cache block";
+        int pendingReads,         desc="Number of outstanding read requests (should not exceed 1)";
+        int pendingWrites,        desc="Number of outstanding write requests";
+    }
+
+    external_type(CacheMemory) {
+        bool cacheAvail(Address);
+        Address cacheProbe(Address);
+        void allocate(Address);
+        void deallocate(Address);
+        Entry lookup(Address);
+        void changePermission(Address, AccessPermission);
+        bool isTagPresent(Address);
+    }
+
+    external_type(TBETable) {
+        TBE lookup(Address);
+        void allocate(Address);
+        void deallocate(Address);
+        bool isPresent(Address);
+    }
+
+    external_type(GlobalWriteVector) {
+       void set(int, Time);
+       Time get(int);
+    }
+
+    TBETable L1_TBEs, template_hack="<L1Cache_TBE>";
+
+    CacheMemory L1DcacheMemory, template_hack="<L1Cache_Entry>", constructor_hack='L1_CACHE_NUM_SETS_BITS,L1_CACHE_ASSOC,MachineType_L1Cache,int_to_string(i)+"_L1D"', abstract_chip_ptr="true";
+
+    MessageBuffer mandatoryQueue, ordered="false", rank="100", abstract_chip_ptr="true";
+
+    Sequencer sequencer, abstract_chip_ptr="true", constructor_hack="i";
+
+
+
+
+    int cache_state_to_int(State state);
+
+    Entry getL1CacheEntry(Address addr), return_by_ref="yes" {
+            if (L1DcacheMemory.isTagPresent(addr)) {
+                return L1DcacheMemory[addr];
+            } else {
+                DEBUG_EXPR(addr);
+                error("cannot get L1 entry, L1 block not present");
+            }
+    }
+
+    void changeL1Permission(Address addr, AccessPermission permission) {
+        if (L1DcacheMemory.isTagPresent(addr)) {
+            return L1DcacheMemory.changePermission(addr, permission);
+        } else {
+            error("cannot change permission, L1 block not present");
+        }
+    }
+
+    Time getDelta_Access(Address addr) {
+        return get_lease_fixed();
+    }
+
+    bool isL1CacheTagPresent(Address addr) {
+        return (L1DcacheMemory.isTagPresent(addr));
+    }
+
+    bool isLive(Address addr) {
+        if(L1_TBEs.isPresent(addr)) {
+            return time_to_int(L1_TBEs[addr].liveUntilTime) >= time_to_int(get_time());
+        } else if (isL1CacheTagPresent(addr)) {
+            return time_to_int(getL1CacheEntry(addr).liveUntilTime) >= time_to_int(get_time());
+        } else {
+            error("Invalid address passed to isLive() in L1");
+        }
+    }
+
+    void setState(Address addr, State state) {
+        // MUST CHANGE
+        if(L1_TBEs.isPresent(addr)) {
+            L1_TBEs[addr].TBEState := state;
+        }
+
+        if (isL1CacheTagPresent(addr)) {
+            getL1CacheEntry(addr).CacheState := state;
+
+            // Set permission
+            if (state == State:I) {
+                changeL1Permission(addr, AccessPermission:Invalid);
+            } else if (state == State:S) {
+                changeL1Permission(addr, AccessPermission:Read_Only);
+            } else {
+                changeL1Permission(addr, AccessPermission:Busy);
+            }
+        }
+    }
+
+    State getState(Address addr) {
+        if(L1DcacheMemory.isTagPresent(addr) == true){
+            DEBUG_EXPR(id);
+            DEBUG_EXPR(addr);
+        }
+
+        if(L1_TBEs.isPresent(addr)) {
+            // If SM state, check to see if it's expired. If so, treat it as a Write -> go to I_I state
+            if(L1_TBEs[addr].TBEState == State:SM && isLive(addr)==false) {
+                return State:I_I;
+            } else {
+                return L1_TBEs[addr].TBEState;
+            }
+        } else if (isL1CacheTagPresent(addr)) {
+
+            // If Timer is expired in cache line then it does not matter what the state is.
+            // If you are building writeback caches then the state has to
+            //  be checked to ensure it is not dirty.
+
+            if (isLive(addr)==false)
+            {
+                return State:I;
+            }
+            else
+            {
+                return getL1CacheEntry(addr).CacheState;
+            }
+        }
+        return State:I;
+    }
+
+    Event mandatory_request_type_to_event(CacheRequestType type) {
+        if (type == CacheRequestType:LD) {
+            return Event:Load;
+        } else if (type == CacheRequestType:ST)  {
+            return Event:L1_WThru;
+        } else if (type == CacheRequestType:ATOMIC)  {
+            return Event:L1_Atomic;
+        } else {
+            error("Invalid CacheRequestType");
+        }
+    }
+
+    bool is_write(CacheRequestType type) {
+        if ((type == CacheRequestType:ST) || (type == CacheRequestType:ATOMIC)) {
+            return true;
+        } else if( (type == CacheRequestType:LD) ) {
+            return false;
+        } else {
+            error("Invalid CacheRequestType");
+        }
+    }
+
+    Address getDummyAddress() {
+        return intToAddress(0);
+    }
+
+    int get_pending_reads(Address addr) {
+       assert(L1_TBEs.isPresent(addr)==true);
+       return L1_TBEs[addr].pendingReads;
+    }
+
+    int get_pending_writes(Address addr) {
+       assert(L1_TBEs.isPresent(addr)==true);
+       return L1_TBEs[addr].pendingWrites;
+    }
+
+
+    out_port(requestIntraChipL1Network_out, RequestMsg, requestFromL1Cache);
+
+    // Response IntraChip L1 Network - response msg to this L1 cache
+    in_port(responseIntraChipL1Network_in, ResponseMsg, responseToL1Cache) {
+        if (responseIntraChipL1Network_in.isReady()) {
+            peek(responseIntraChipL1Network_in, ResponseMsg) {
+
+                // Process the response from L2 cache
+                assert(in_msg.Destination.isElement(machineID));
+                if(in_msg.Type == CoherenceResponseType:DATA) {
+                    // Here is the latest data, you are already complete.
+                    // Received on reads only
+                    assert(get_pending_reads(in_msg.Address) == 1);
+                    if(get_pending_writes(in_msg.Address) > 0) {
+                       trigger(Event:Data, in_msg.Address);
+                    } else{
+                       trigger(Event:Data_Done, in_msg.Address);
+                    }
+                } else if(in_msg.Type == CoherenceResponseType:DATA_ATOMIC) {
+                    // Atomic data response, you are already complete
+                   assert(get_pending_writes(in_msg.Address) > 0);
+                   if(get_pending_reads(in_msg.Address) > 0 || get_pending_writes(in_msg.Address) > 1) {
+                      trigger(Event:DataAtomic, in_msg.Address);
+                   } else {
+                      trigger(Event:DataAtomic_Done, in_msg.Address);
+                   }
+                } else if(in_msg.Type == CoherenceResponseType:ACK) {
+                    // Ack to writes that are complete
+                   assert(get_pending_writes(in_msg.Address) > 0);
+                   if(get_pending_reads(in_msg.Address) > 0 || get_pending_writes(in_msg.Address) > 1) {
+                      trigger(Event:Ack, in_msg.Address);
+                   } else {
+                      trigger(Event:Ack_Done, in_msg.Address);
+                   }
+                } else {
+                    error("Invalid L1 response type");
+                }
+            }
+
+        }
+
+    }
+
+    // Mandatory Queue betweens Node's CPU and it's L1 caches
+    in_port(mandatoryQueue_in, CacheMsg, mandatoryQueue, desc="...") {
+        if (mandatoryQueue_in.isReady()) {
+            peek(mandatoryQueue_in, CacheMsg) {
+
+                 // *** DATA ACCESS ***
+                 // If WThru Access then we want to issue the request without checking for space.
+                 // Note: For Atomics, we actually want to allocate space because we will be getting data back anyways,
+                 //       might as well put it in the cache
+                 if (in_msg.Type == CacheRequestType:ST)
+                 {
+                     // Trigger an access
+                     trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                 }
+                 // Read or Write access. Allocating space if needed.
+                 else
+                 {
+                     if (L1DcacheMemory.isTagPresent(in_msg.Address)) {
+                         // The tag matches for the L1, so the L1 ask the L2 for it
+                         trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                     } else {
+                         if (L1DcacheMemory.cacheAvail(in_msg.Address)) {
+                             // L1 does't have the line, but we have space for it in the L1 let's see if the L2 has it
+                             trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                         } else {
+                             // No room in the L1, so we need to make room in the L1
+                             trigger(Event:L1_Replacement, L1DcacheMemory.cacheProbe(in_msg.Address));
+                         }
+                     }
+                 }
+
+            }
+        }
+    }
+
+
+    // ACTIONS
+    action(a_issueGETS, "a", desc="Issue GETS") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_to_L2_MSG_LATENCY") {
+                out_msg.Address := address;
+                out_msg.Type := CoherenceRequestType:GETS;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+                DEBUG_EXPR(address);
+                DEBUG_EXPR(out_msg.Destination);
+                out_msg.MessageSize := MessageSizeType:Control;
+                out_msg.Prefetch := in_msg.Prefetch;
+                out_msg.AccessMode := in_msg.AccessMode;
+                out_msg.Space := in_msg.Space;
+                out_msg.RequestSize := get_DATA_BLOCK_BYTES();  // miss fetches entire block
+                out_msg.deltaRequested := getDelta_Access(address); // Need to predict delta time somehow
+                out_msg.memfetch := in_msg.memfetch;
+            }
+        }
+    }
+
+    action(u_sendUpgradeToL2, "u", desc="send upgrade to the L2 cache") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_to_L2_DATA_LATENCY") {
+                assert(L1_TBEs.isPresent(address));
+                out_msg.Address := address;
+                out_msg.Type := CoherenceRequestType:DATA_UPGRADE;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+                out_msg.MessageSize := IntToMessageSizeType(in_msg.Size);   // only need to send dirty data
+                out_msg.Space := in_msg.Space;
+                out_msg.RequestSize := in_msg.Size;
+                out_msg.Dirty := true;
+                out_msg.liveUntilTime := L1_TBEs[address].liveUntilTime; // send block's lifetime for matching at L2
+                out_msg.memfetch := in_msg.memfetch;
+            }
+        }
+    }
+
+
+    action(d2t_sendDataToL2_fromTBE, "d2t", desc="send data to the L2 cache from TBE") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_to_L2_DATA_LATENCY") {
+                out_msg.Address := address;
+                out_msg.Type := CoherenceRequestType:DATA;
+                out_msg.DataBlk := L1_TBEs[address].DataBlk;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+                out_msg.MessageSize := IntToMessageSizeType(in_msg.Size);   // only need to send dirty data
+                out_msg.Space := in_msg.Space;
+                out_msg.RequestSize := in_msg.Size;
+                out_msg.Dirty := true;
+                // Note: there is no time to send because this is a write-miss
+                out_msg.memfetch := in_msg.memfetch;
+            }
+        }
+    }
+
+    action(d2t_sendAtomicDataToL2_fromTBE, "d2t_a", desc="send Atomic data to the L2 cache from TBE") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_to_L2_DATA_LATENCY") {
+                out_msg.Address := address;
+                out_msg.Type := CoherenceRequestType:DATA_ATOMIC;
+                out_msg.DataBlk := L1_TBEs[address].DataBlk;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+                out_msg.MessageSize := IntToMessageSizeType(in_msg.Size);   // only need to send dirty data
+                out_msg.Space := in_msg.Space;
+                out_msg.RequestSize := in_msg.Size;
+                out_msg.Dirty := true;
+                // Note: there is no time to send because this is a write-miss
+                out_msg.memfetch := in_msg.memfetch;
+            }
+        }
+    }
+
+
+    action(h_load_hit, "h", desc="If not prefetch, notify sequencer the load completed.") {
+        sequencer.readCallback(address);
+    }
+
+    action(hh_store_hit, "\h", desc="If not prefetch, notify sequencer that store completed.") {
+       peek(responseIntraChipL1Network_in, ResponseMsg) {
+          sequencer.writeCallback(in_msg.Address, in_msg.memfetch);
+          //sequencer.writeCallback(in_msg.Address);
+       }
+    }
+
+    action(i_allocateTBE, "i", desc="Allocate TBE") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            check_allocate(L1_TBEs);
+            L1_TBEs.allocate(address);
+            L1_TBEs[address].isPrefetch := false;
+            //L1_TBEs[address].DataBlk := getL1CacheEntry(address).DataBlk;
+            L1_TBEs[address].Space := in_msg.Space;
+            L1_TBEs[address].ThreadID := in_msg.ThreadID;
+        }
+    }
+
+    action(i_allocateTBEwTime, "ist", desc="Allocate TBE with lifetime from Cache") {
+        peek(mandatoryQueue_in, CacheMsg) {
+            check_allocate(L1_TBEs);
+            L1_TBEs.allocate(address);
+            L1_TBEs[address].isPrefetch := false;
+            //L1_TBEs[address].DataBlk := getL1CacheEntry(address).DataBlk;   //how do you get DataBlk from CacheMsg??
+            L1_TBEs[address].Space := in_msg.Space;
+            L1_TBEs[address].ThreadID := in_msg.ThreadID;
+            // Get lifetime from cache, so make sure it exists
+            assert(isL1CacheTagPresent(address));
+            // This is needed because we are going to SM so block can expire and needs to go to I_I when that happens
+            L1_TBEs[address].liveUntilTime := getL1CacheEntry(address).liveUntilTime;
+        }
+    }
+
+    action(k_popMandatoryQueue, "k", desc="Pop mandatory queue.") {
+        mandatoryQueue_in.dequeue();
+    }
+
+    action(o_popIncomingResponseQueue, "o", desc="Pop Incoming Response queue and profile the delay within this virtual network") {
+        // Profile
+        peek(responseIntraChipL1Network_in, ResponseMsg) {
+            if(in_msg.Type == CoherenceResponseType:DATA) {
+               profileBandwidth("L2_DATA", in_msg.MessageSize);
+            } else if(in_msg.Type == CoherenceResponseType:ACK) {
+               profileBandwidth("L2_MSG", in_msg.MessageSize);
+            } else if(in_msg.Type == CoherenceResponseType:DATA_ATOMIC) {
+               profileBandwidth("L2_ATOMIC", in_msg.MessageSize);
+            } else {
+              error("Invalid L1 response type");
+            }
+        }
+        responseIntraChipL1Network_in.dequeue();
+    }
+
+    action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+        assert(L1_TBEs[address].pendingReads == 0);
+        assert(L1_TBEs[address].pendingWrites == 0);
+        L1_TBEs.deallocate(address);
+    }
+
+    action(t_updateL1Lifetime, "t", desc="Update L1 block's lifetime from reponse msg") {
+        peek(responseIntraChipL1Network_in, ResponseMsg) {
+            assert(isL1CacheTagPresent(in_msg.Address));
+            getL1CacheEntry(address).liveUntilTime := in_msg.liveUntilTime;
+        }
+    }
+
+    action(dd_writeDataToL1Cache, "dd", desc="Write data to cache from L2 response queue") {
+        peek(responseIntraChipL1Network_in, ResponseMsg) {
+            assert(isL1CacheTagPresent(in_msg.Address));
+            getL1CacheEntry(address).DataBlk := in_msg.DataBlk;
+        }
+    }
+
+    action(dt_writeDataToL1CacheFromTBE, "dt", desc="Write data to cache from TBE") {
+         assert(isL1CacheTagPresent(address));
+         getL1CacheEntry(address).DataBlk := L1_TBEs[address].DataBlk;
+    }
+
+    action(ff_deallocateL1CacheBlock, "\f", desc="Deallocate L1 cache block.  Sets the cache to not present, allowing a replacement in parallel with a fetch.") {
+        if (L1DcacheMemory.isTagPresent(address)) {
+            L1DcacheMemory.deallocate(address);
+        } else {
+            error("cannot deallocate, L1 block not present");
+        }
+    }
+
+    action(oo_allocateL1DCacheBlock, "\o", desc="Set L1 D-cache tag equal to tag of block B.") {
+        if (L1DcacheMemory.isTagPresent(address) == false) {
+            L1DcacheMemory.allocate(address);
+        }
+    }
+
+    action(z_recycleMandatoryQueue, "\zz", desc="recycle L1 request queue") {
+        mandatoryQueue_in.recycle();
+    }
+
+    action(z_stall, "z", desc="stall - i.e. do nothing") {
+    }
+
+
+    action(pM_profileMiss, "pM", desc="Profile a demand miss") {
+      peek(mandatoryQueue_in, CacheMsg) {
+         assert(in_msg.profiled == false);
+         profile_L1Cache_request_g(in_msg, id, true /*miss*/);
+      }
+    }
+
+    action(pH_profileHit, "pH", desc="Profile a demand hit") {
+      peek(mandatoryQueue_in, CacheMsg) {
+         assert(in_msg.profiled == false);
+         profile_L1Cache_request_g(in_msg, id, false /*hit*/);
+      }
+    }
+
+
+
+    action(pr_incPendingRead, "pr+", desc="Increment pending read count") {
+       assert(L1_TBEs.isPresent(address)==true);
+       L1_TBEs[address].pendingReads := L1_TBEs[address].pendingReads + 1;
+    }
+    action(pw_incPendingWrite, "pw+", desc="Increment pending write count") {
+       assert(L1_TBEs.isPresent(address)==true);
+       L1_TBEs[address].pendingWrites := L1_TBEs[address].pendingWrites + 1;
+    }
+
+    action(pr_decPendingRead, "pr-", desc="Decrement pending read count") {
+       assert(L1_TBEs.isPresent(address)==true);
+       L1_TBEs[address].pendingReads := L1_TBEs[address].pendingReads - 1;
+       assert(L1_TBEs[address].pendingReads >= 0);
+    }
+    action(pw_decPendingWrite, "pw-", desc="Decrement pending write count") {
+       assert(L1_TBEs.isPresent(address)==true);
+       L1_TBEs[address].pendingWrites := L1_TBEs[address].pendingWrites - 1;
+       assert(L1_TBEs[address].pendingWrites >= 0);
+    }
+
+
+    //*****************************************************
+    // TRANSITIONS
+    //*****************************************************
+
+    // Transitions from Idle
+    transition({I}, Load, I_S) {
+        pM_profileMiss;
+        oo_allocateL1DCacheBlock;
+        i_allocateTBE;
+        pr_incPendingRead;
+        a_issueGETS;
+        k_popMandatoryQueue;
+    }
+
+    transition({I}, L1_WThru, I_I) {
+        pM_profileMiss;
+        i_allocateTBE;
+        pw_incPendingWrite;
+        d2t_sendDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+    transition({I}, L1_Atomic, I_I) {
+        pM_profileMiss;
+        i_allocateTBE;
+        pw_incPendingWrite;
+        d2t_sendAtomicDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+
+    // This happens for expired blocks that getState returns as I
+    transition(I, L1_Replacement, I) {
+        ff_deallocateL1CacheBlock;
+    }
+
+
+    // Transitions from Shared
+    transition(S, {Load}) {
+        pH_profileHit;
+        h_load_hit;
+        k_popMandatoryQueue;
+    }
+
+    transition(S, {L1_WThru}, SM) {
+        pH_profileHit;
+        i_allocateTBEwTime;
+        pw_incPendingWrite;
+        u_sendUpgradeToL2;
+        //  ff_deallocateL1CacheBlock;
+        k_popMandatoryQueue;
+    }
+
+    transition(S, {L1_Atomic}, I_I) {
+        pH_profileHit;
+        i_allocateTBEwTime;
+        pw_incPendingWrite;
+        d2t_sendAtomicDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+
+    transition({S}, L1_Replacement, I) {
+        ff_deallocateL1CacheBlock;
+    }
+
+    // Transitions from I_S
+
+    // A write request while waiting for a load response
+    // Can't upgrade because we don't have a valid timestamp, go to I_I
+    transition(I_S, L1_WThru, I_I) {
+        pM_profileMiss;
+        pw_incPendingWrite;
+        d2t_sendDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+    // An atomic request while waiting for a load response
+    // Go to I_I as we always do for atomics
+    transition(I_S, L1_Atomic, I_I) {
+        pM_profileMiss;
+        pw_incPendingWrite;
+        d2t_sendAtomicDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+
+    // This is a response to a load
+    // If we get Data_Done in SM, this means that a load was issued after an upgrade
+    transition({I_S,SM}, Data_Done, S) {
+        pr_decPendingRead;
+        dd_writeDataToL1Cache;
+        t_updateL1Lifetime;
+        h_load_hit;
+        s_deallocateTBE;
+        o_popIncomingResponseQueue;
+    }
+
+    transition({I_S, I_I, SM}, L1_Replacement) {
+        //z_recycleMandatoryQueue;
+       z_stall;
+    }
+
+
+    // Transitions from I_I
+
+    // Load request while waiting for writes/atomics
+    // If we get a load request while waiting for an Upgrade response, we have to treat this as a
+    // load miss because we cannot allow another thread to read a write early (write atomicity)
+    transition({I_I,SM}, Load) {
+        pM_profileMiss;
+        pr_incPendingRead;
+        a_issueGETS;
+        k_popMandatoryQueue;
+    }
+
+    // A write request while waiting for another write
+    transition(I_I, L1_WThru) {
+        pM_profileMiss;
+        pw_incPendingWrite;
+        d2t_sendDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+    // An atomic request while waiting for pending write/atomic requests
+    transition(I_I, L1_Atomic) {
+        pM_profileMiss;
+        pw_incPendingWrite;
+        d2t_sendAtomicDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+    // This is a response to a load
+    // If we get Data response in SM, it means we have an Upgrade-Load-Upgrade sequence
+    // no need to update timestamp in this case because the next upgrade will do it anyways
+    transition({I_I,SM}, Data) {
+        pr_decPendingRead;
+        h_load_hit;
+        o_popIncomingResponseQueue;
+    }
+    transition(I_I, Data_Done, I) {
+        pr_decPendingRead;
+        h_load_hit;
+        s_deallocateTBE;
+        o_popIncomingResponseQueue;
+    }
+
+    // Got DataAtomic response from L2. We can always go to S after an Atomic
+    // Atomic data response always updates the global time. This is because at the L2 we aren't comparing timestamps
+    // for L2_Atomic requests
+    transition(I_I, DataAtomic) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        o_popIncomingResponseQueue;
+    }
+    transition(I_I, DataAtomic_Done, I) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        s_deallocateTBE;
+        o_popIncomingResponseQueue;
+    }
+
+    // Got an Ack to a Write, write is globally visible
+    transition(I_I, Ack) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        o_popIncomingResponseQueue;
+    }
+    transition(I_I, Ack_Done, I) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        s_deallocateTBE;
+        o_popIncomingResponseQueue;
+    }
+
+    // Transitions from SM
+
+    // Got another write request while we were waiting for an Upgrade response
+    // Just send out another Upgrade because we are still effectively in S because
+    // timestamp is always valid in an SM state
+    transition(SM, L1_WThru) {
+        pH_profileHit;
+        pw_incPendingWrite;
+        u_sendUpgradeToL2;
+        k_popMandatoryQueue;
+    }
+
+    // Got an atomic request while waiting for an Upgrade response
+    // Go to I_I as we always do for atomics
+    transition(SM, L1_Atomic, I_I) {
+        pH_profileHit;
+        pw_incPendingWrite;
+        d2t_sendAtomicDataToL2_fromTBE;
+        k_popMandatoryQueue;
+    }
+
+    // Got an Ack to an Upgrade. This was a private write. i.e., L1 timestamp = L2 timestamp at time of write
+    transition(SM, Ack) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        t_updateL1Lifetime;
+        o_popIncomingResponseQueue;
+    }
+    transition(SM, Ack_Done, S) {
+        pw_decPendingWrite;
+        hh_store_hit;
+        t_updateL1Lifetime;
+        s_deallocateTBE;
+        o_popIncomingResponseQueue;
+    }
+}
+
+
+

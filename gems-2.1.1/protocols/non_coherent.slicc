@@ -1,0 +1,6 @@
+../protocols/non_coherent-msg.sm
+../protocols/non_coherent-L2cache.sm
+../protocols/non_coherent-L1cache.sm
+../protocols/non_coherent-mem.sm
+../protocols/standard_CMP-protocol.sm
+

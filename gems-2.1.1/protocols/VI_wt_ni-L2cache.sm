@@ -1,0 +1,1194 @@
+
+/*
+    Copyright (C) 1999-2005 by Mark D. Hill and David A. Wood for the
+    Wisconsin Multifacet Project.  Contact: gems@cs.wisc.edu
+    http://www.cs.wisc.edu/gems/
+
+    --------------------------------------------------------------------
+
+    This file is part of the SLICC (Specification Language for
+    Implementing Cache Coherence), a component of the Multifacet GEMS
+    (General Execution-driven Multiprocessor Simulator) software
+    toolset originally developed at the University of Wisconsin-Madison.
+                                                                                
+    SLICC was originally developed by Milo Martin with substantial
+    contributions from Daniel Sorin.
+
+    Substantial further development of Multifacet GEMS at the
+    University of Wisconsin was performed by Alaa Alameldeen, Brad
+    Beckmann, Jayaram Bobba, Ross Dickson, Dan Gibson, Pacia Harper,
+    Derek Hower, Milo Martin, Michael Marty, Carl Mauer, Michelle Moravan,
+    Kevin Moore, Manoj Plakal, Daniel Sorin, Haris Volos, Min Xu, and Luke Yen.
+
+    --------------------------------------------------------------------
+
+    If your use of this software contributes to a published paper, we
+    request that you (1) cite our summary paper that appears on our
+    website (http://www.cs.wisc.edu/gems/) and (2) e-mail a citation
+    for your published paper to gems@cs.wisc.edu.
+
+    If you redistribute derivatives of this software, we request that
+    you notify us and either (1) ask people to register with us at our
+    website (http://www.cs.wisc.edu/gems/) or (2) collect registration
+    information and periodically send it to us.
+
+    --------------------------------------------------------------------
+
+    Multifacet GEMS is free software; you can redistribute it and/or
+    modify it under the terms of version 2 of the GNU General Public
+    License as published by the Free Software Foundation.
+
+    Multifacet GEMS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the Multifacet GEMS; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+    02111-1307, USA
+
+    The GNU General Public License is contained in the file LICENSE.
+
+### END HEADER ###
+*/
+/*
+ * $Id: MSI_MOSI_CMP_directory-L2cache.sm 1.12 05/01/19 15:55:40-06:00 beckmann@s0-28.cs.wisc.edu $
+ *
+ */
+
+machine(L2Cache, "Non-inclusive VI Write-Through L2 Cache CMP") {
+
+  // L2 BANK QUEUES
+  // From local bank of L2 cache TO the network
+  MessageBuffer responseFromL2Cache, network="To", virtual_network="1", ordered="true";  // this L2 bank -> a local L1
+  MessageBuffer L1RequestFromL2Cache, network="To", virtual_network="3", ordered="true";  // this L2 bank -> a local L1
+
+  // FROM the network to this local bank of L2 cache
+  MessageBuffer L1RequestToL2Cache, network="From", virtual_network="0", ordered="true";  // a local L1 -> this L2 bank
+  MessageBuffer unblockToL2Cache, network="From", virtual_network="2", ordered="true";  // a local L1 -> this L2 bank
+
+  // STATES
+  enumeration(State, desc="L2 Directory states", default="L2Cache_State_NP") {
+    // Base states
+    NP, desc="Not present in directory (or cache)";
+
+    S, desc="L2 cache entry valid, no sharers in directory";
+    SS, desc="L2 cache entry valid, multiple sharers in directory";
+
+    S_D, desc="L2 cache invalid, no sharers in directory";
+    SS_D, desc="L2 cache entry invalid, multiple sharers in directory";
+
+    // Transient States for fetching data from memory
+    ISS, desc="L2 idle, got L1_GETS, issued memory fetch, have not seen response yet";
+    IM, desc="L2 idle, got L1 Data, issued memory fetch, have not seen response(s) yet";
+    IDM, desc="L2 idle but with sharers, got L1 Data, issued memory fetch, have not seen response(s) yet";
+    IMA, desc="L2 idle, got L1 Atomic, issued memory fetch, have not seen response(s) yet";
+
+    // Transient states for invalidations
+    SM, desc="Got a write to shared, sent invalidations, waiting for invalidation acks";
+    SMA, desc="Got an atomic to shared, sent invalidations, waiting for invalidation acks";
+
+    SDM, desc="Got a write to shared with no data, sent invalidations and memory fetch, waiting for invalidation acks and memory data";
+    SDMA, desc="Got an atomic to shared with no data, sent invalidations and memory fetch, waiting for invalidation acks and memory data";
+
+    MI, desc="L2 replacing dirty data, wait for all invalidations to come back and then send data to memory";
+    II, desc="L2 replacing clean data, wait for all invalidations to come back and then drop data";
+  }
+
+  // EVENTS
+  enumeration(Event, desc="L2 Directory events") {
+    // L2 events
+
+    // events initiated by the local L1s
+    L1_GETS,                 desc="a L1D GETS request for a block maped to us";
+
+    // Store from L1
+    WB_Data,  desc="Write data from L1";
+    WB_Data_Priv,  desc="Write data from L1 by private sharer";
+    L2_Atomic,  desc="Atomic request and data from L1";
+    L2_Atomic_Priv,  desc="Atomic request and data from L1 by private sharer";
+
+    Inv_Ack,      desc="Received invalidation ack from L1";
+    Inv_Ack_All,  desc="Received all invalidation acks from L1";
+
+    // events initiated by this L2
+    Dir_Replacement,     desc="Dir Replacement, dirty data exists in L2", format="!r";
+    Dir_Replacement_clean,     desc="Dir Replacement, clean data exists in L2", format="!r";
+    Dir_Replacement_nodata,    desc="Dir Replacement, no data exists in L2", format="!r";
+
+    L2_Replacement,     desc="L2 Replacement of dirty data", format="!r";
+    L2_Replacement_clean,     desc="L2 Replacement of clean data", format="!r";
+
+    // events from memory controller
+    Mem_Data,     desc="data from memory", format="!r";
+  }
+
+  // TYPES
+
+  // Interface to off-chip GDDR memory
+  external_type(GpusimDramInterface, inport="yes", outport="yes") {
+  }
+
+  // DirectoryEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,          desc="cache state";
+    NetDest Sharers,               desc="tracks the L1 shares on-chip";
+  }
+
+  // CacheEntry
+  structure(CacheEntry, desc="...", interface="AbstractCacheEntry") {
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false", desc="data is dirty";
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Address Address,            desc="Physical address for this TBE";
+    State TBEState,             desc="Transient state";
+    DataBlock DataBlk,          desc="Buffer for the data block";
+    bool Dirty, default="false", desc="Data is Dirty";
+
+    NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
+    MachineID L1_WBAck_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
+
+    bool isPrefetch,            desc="Set if this was caused by a prefetch";
+    MemorySpaceType Space,        desc="Memory space of request (GLOBAL, LOCAL)";
+    int RequestSize,            desc="Size of request data";
+    uint64 memfetch,               desc="Memfetch of requestor thread";
+    MemfetchSet mfset,            desc="Set of memfetchs received so far in this TBE";
+
+    int pendingAcks,            desc="number of pending acks for invalidations";
+  }
+
+  external_type(CacheMemory) {
+    bool cacheAvail(Address);
+    Address cacheProbe(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    CacheEntry lookup(Address);
+    void changePermission(Address, AccessPermission);
+    bool isTagPresent(Address);
+    void setMRU(Address);
+  }
+
+  external_type(DirectoryCacheMemory) {
+    bool cacheAvail(Address);
+    Address cacheProbe(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    Entry lookup(Address);
+    void changePermission(Address, AccessPermission);
+    bool isTagPresent(Address);
+    void setMRU(Address);
+  }
+
+  external_type(TBETable) {
+    TBE lookup(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    bool isPresent(Address);
+  }
+
+  // Objects
+  GpusimDramInterface GpusimDramBuffer, abstract_chip_ptr="true", constructor_hack="i";
+
+  TBETable L2_TBEs, template_hack="<L2Cache_TBE>";
+
+  DirectoryCacheMemory L2DirectoryMemory, template_hack="<L2Cache_Entry>", constructor_hack='L2_DIRECTORY_NUM_SETS_BITS,L2_DIRECTORY_ASSOC,MachineType_L2Cache,int_to_string(i)';
+
+  CacheMemory L2cacheMemory, template_hack="<L2Cache_CacheEntry>", constructor_hack='L2_CACHE_NUM_SETS_BITS,L2_CACHE_ASSOC,MachineType_L2Cache,int_to_string(i)';
+
+  Entry getDirectoryEntry(Address addr), return_by_ref="yes" {
+    return L2DirectoryMemory[addr];
+  }
+
+
+  void changeDirectoryPermission(Address addr, AccessPermission permission) {
+    if (L2DirectoryMemory.isTagPresent(addr)) {
+      return L2DirectoryMemory.changePermission(addr, permission);
+    }
+  }
+
+  string getCoherenceRequestTypeStr(CoherenceRequestType type) {
+    return CoherenceRequestType_to_string(type);
+  }
+
+  bool isDirectoryTagPresent(Address addr) {
+    return (L2DirectoryMemory.isTagPresent(addr));
+  }
+
+  bool isL2CacheTagPresent(Address addr) {
+      return (L2cacheMemory.isTagPresent(addr));
+    }
+
+
+  State getState(Address addr) {
+    if(L2_TBEs.isPresent(addr)) { 
+      return L2_TBEs[addr].TBEState;
+    } else if (isDirectoryTagPresent(addr)) {
+      return getDirectoryEntry(addr).CacheState;
+    }
+
+    // If not in the directory then also must not be in the L2 cache
+    assert( isL2CacheTagPresent(addr) == false );
+
+    return State:NP;
+  }
+
+  string getStateStr(Address addr) {
+    return L2Cache_State_to_string(getState(addr));
+  }
+
+  void setState(Address addr, State state) {
+
+    // MUST CHANGE
+    if (L2_TBEs.isPresent(addr)) {
+      L2_TBEs[addr].TBEState := state;
+    }
+
+    if (isDirectoryTagPresent(addr)) {
+      getDirectoryEntry(addr).CacheState := state;
+    
+      // Set permission  
+      if (state == State:SS ) {
+        changeDirectoryPermission(addr, AccessPermission:Read_Write);
+      } else { 
+        changeDirectoryPermission(addr, AccessPermission:Busy);
+      }
+    }
+  }
+
+  bool isOneSharerLeft(Address addr, MachineID requestor) {
+    assert(L2DirectoryMemory[addr].Sharers.isElement(requestor));
+    return (L2DirectoryMemory[addr].Sharers.count() == 1);
+  }
+
+  bool isSharer(Address addr, MachineID requestor) {
+    if (L2DirectoryMemory.isTagPresent(addr)) {
+      return L2DirectoryMemory[addr].Sharers.isElement(requestor);
+    } else {
+      return false;
+    }
+  }
+
+  Event L1Cache_request_type_to_event(CoherenceRequestType type, Address addr, MachineID requestor) {
+    if(type == CoherenceRequestType:GETS) {
+      return Event:L1_GETS;
+    } else if (type == CoherenceRequestType:DATA) {
+      // Check if we have a private write
+      if( isDirectoryTagPresent(addr) && isSharer(addr,requestor) && isOneSharerLeft(addr,requestor) ) {
+         return Event:WB_Data_Priv;
+      } else {
+         return Event:WB_Data;
+      }
+    } else if (type == CoherenceRequestType:DATA_ATOMIC) {
+       // Check if we have a private atomic
+       if( isDirectoryTagPresent(addr) && isSharer(addr,requestor) && isOneSharerLeft(addr,requestor) ) {
+          return Event:L2_Atomic_Priv;
+       } else {
+          return Event:L2_Atomic;
+       }
+    } else {
+      error("Invalid L1 forwarded request type");
+    }
+  }
+
+  void addSharer(Address addr, MachineID requestor) {
+    assert(map_L1CacheMachId_to_L2Cache(addr, requestor) == machineID);
+    L2DirectoryMemory[addr].Sharers.add(requestor);
+  }
+
+
+  bool is_write(CoherenceRequestType type) {
+     return (type == CoherenceRequestType:DATA || type == CoherenceRequestType:DATA_ATOMIC);
+  }
+
+  // ** OUT_PORTS **
+
+  out_port(L1RequestIntraChipL2Network_out, RequestMsg, L1RequestFromL2Cache);
+  out_port(memQueue_out, MemoryMsg, GpusimDramBuffer);
+  out_port(responseIntraChipL2Network_out, ResponseMsg, responseFromL2Cache);
+
+
+  // ** IN_PORTS **
+
+  // Unblock to this L2 bank
+  in_port(L1unblockNetwork_in, ResponseMsg, unblockToL2Cache) {
+     if(L1unblockNetwork_in.isReady()) {
+        peek(L1unblockNetwork_in,  ResponseMsg) {
+           assert(in_msg.Destination.isElement(machineID));
+           if (in_msg.Type == CoherenceResponseType:INV_ACK || in_msg.Type == CoherenceResponseType:RECALL_ACK) {
+              assert(L2_TBEs.isPresent(in_msg.Address));
+              if ((L2_TBEs[in_msg.Address].pendingAcks - in_msg.AckCount) == 0) {
+                 trigger(Event:Inv_Ack_All, in_msg.Address);
+              } else {
+                 trigger(Event:Inv_Ack, in_msg.Address);
+              }
+           } else {
+              error("unknown unblock message");
+           }
+        }
+     }
+  }
+
+  // off-chip memory request/response is done
+  in_port(memQueue_in, MemoryMsg, GpusimDramBuffer) {
+    if (memQueue_in.isReady()) {
+      peek(memQueue_in, MemoryMsg) {
+        if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+            trigger(Event:Mem_Data, in_msg.Address);  // L2 now has data
+        } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+          // Pop DRAM Ack without event
+          memQueue_in.dequeue();
+        } else {
+          DEBUG_EXPR(in_msg.Type);
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+  // L1 Request
+  in_port(L1RequestIntraChipL2Network_in, RequestMsg, L1RequestToL2Cache) {
+    if(L1RequestIntraChipL2Network_in.isReady()) {
+      peek(L1RequestIntraChipL2Network_in,  RequestMsg) {
+        assert(machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache);
+        assert(in_msg.Destination.isElement(machineID));
+
+        // A write or a read
+        // First allocate space in the L2 cache, then in the directory
+        if(isL2CacheTagPresent(in_msg.Address) || L2cacheMemory.cacheAvail(in_msg.Address)) {
+           // The L2 either has this address or has space for it
+
+           if (L2DirectoryMemory.isTagPresent(in_msg.Address)) {
+              // The directory contains the block, so proceeded with handling the request
+              trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.Address, in_msg.Requestor), in_msg.Address);
+           } else {
+              if (L2DirectoryMemory.cacheAvail(in_msg.Address)) {
+                 // Directory doesn't have the line, but we have space for it in the directory
+                 trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.Address, in_msg.Requestor), in_msg.Address);
+              } else {
+                 // No room in the directory, so we need to make room before handling the request
+                 if(isL2CacheTagPresent( L2DirectoryMemory.cacheProbe(in_msg.Address) )) {
+                    // L2Cache contains valid tag for eviction candidate
+                    if (L2cacheMemory[ L2DirectoryMemory.cacheProbe(in_msg.Address) ].Dirty ) {
+                       trigger(Event:Dir_Replacement, L2DirectoryMemory.cacheProbe(in_msg.Address));
+                    } else {
+                       trigger(Event:Dir_Replacement_clean, L2DirectoryMemory.cacheProbe(in_msg.Address));
+                    }
+                 } else {
+                    // L2Cache does not contain eviction candidate
+                    trigger(Event:Dir_Replacement_nodata, L2DirectoryMemory.cacheProbe(in_msg.Address));
+                 }
+              }
+           }
+
+        } else {
+           // The L2 does not have this address and is full, need to evict a block out
+           assert(L2DirectoryMemory.isTagPresent( L2cacheMemory.cacheProbe(in_msg.Address) ) == true);  // the block in L2 must exist in directory too
+           if (L2cacheMemory[ L2cacheMemory.cacheProbe(in_msg.Address) ].Dirty ) {
+              trigger(Event:L2_Replacement, L2cacheMemory.cacheProbe(in_msg.Address));
+           } else {
+              trigger(Event:L2_Replacement_clean, L2cacheMemory.cacheProbe(in_msg.Address));
+           }
+        }
+
+      }
+    }
+  }
+
+
+  // ACTIONS
+
+  action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      enqueue(memQueue_out, MemoryMsg, latency="L2_to_MEM_MSG_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := MemoryRequestType:MEMORY_READ;
+        out_msg.Sender := machineID;
+        out_msg.OriginalRequestorMachId := machineID;
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
+    }
+  }
+
+  action(a_issueFetchToMemoryForStore, "as", desc="fetch data from memory for store") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      enqueue(memQueue_out, MemoryMsg, latency="L2_to_MEM_MSG_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := MemoryRequestType:MEMORY_READ;
+        out_msg.Sender := machineID;
+        out_msg.OriginalRequestorMachId := machineID;
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
+    }
+  }
+
+  action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    enqueue(memQueue_out, MemoryMsg, latency="L2_to_MEM_DATA_LATENCY") {
+      out_msg.Address := address;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.OriginalRequestorMachId := machineID;
+      assert(isL2CacheTagPresent(address) == true);
+      out_msg.DataBlk := L2cacheMemory[address].DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(c_exclusiveReplacementTBE, "ct", desc="Send data to memory") {
+    enqueue(memQueue_out, MemoryMsg, latency="L2_to_MEM_DATA_LATENCY") {
+      assert(L2_TBEs.isPresent(address));
+      out_msg.Address := address;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.OriginalRequestorMachId := machineID;
+      out_msg.DataBlk := L2_TBEs[address].DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(ds_sendDataToRequestor, "ds", desc="Send data from cache to reqeustor") {
+      peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+        enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_DATA_LATENCY") {
+          out_msg.Address := address;
+          out_msg.Type := CoherenceResponseType:DATA;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          assert(isL2CacheTagPresent(address) == true);
+          out_msg.DataBlk := L2cacheMemory[address].DataBlk;
+          out_msg.MessageSize := IntToMessageSizeType(in_msg.RequestSize);
+          out_msg.AckCount := 0;
+          out_msg.Space := in_msg.Space;
+          out_msg.RequestSize := in_msg.RequestSize;
+          out_msg.mfset.insert(in_msg.Requestor, in_msg.memfetch);
+        }
+      }
+    }
+
+  action(de_sendAckToRequestor, "de", desc="Send WB Ack from cache to requestor") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+         enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_MSG_LATENCY") {
+           out_msg.Address := address;
+           out_msg.Type := CoherenceResponseType:WB_ACK;
+           out_msg.Sender := machineID;
+           out_msg.Destination.add(in_msg.Requestor);
+           out_msg.MessageSize := MessageSizeType:Response_Control;
+           out_msg.Space := in_msg.Space;
+           out_msg.RequestSize := in_msg.RequestSize;
+           out_msg.memfetch := in_msg.memfetch;
+         }
+     }
+  }
+
+  action(ds_sendAtomicDataToRequestor, "ds_a", desc="Send Atomic data from cache to requestor") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+         enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_DATA_LATENCY") {
+           out_msg.Address := address;
+           out_msg.Type := CoherenceResponseType:DATA_ATOMIC;
+           out_msg.Sender := machineID;
+           out_msg.Destination.add(in_msg.Requestor);
+           out_msg.MessageSize := IntToMessageSizeType(in_msg.RequestSize);
+           out_msg.Space := in_msg.Space;
+           out_msg.RequestSize := in_msg.RequestSize;
+           out_msg.memfetch := in_msg.memfetch;
+         }
+     }
+  }
+
+  action(e_sendDataToGetSRequestors, "e", desc="Send data from cache to all GetS IDs") {
+    assert(L2_TBEs[address].L1_GetS_IDs.count() > 0);
+    enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_DATA_LATENCY") {
+      out_msg.Address := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination := L2_TBEs[address].L1_GetS_IDs;  // internal nodes
+      assert(isL2CacheTagPresent(address) == true);
+      out_msg.DataBlk := L2cacheMemory[address].DataBlk;
+      out_msg.MessageSize := IntToMessageSizeType(L2_TBEs[address].RequestSize);
+      out_msg.Space := L2_TBEs[address].Space;
+      out_msg.RequestSize := L2_TBEs[address].RequestSize;
+      out_msg.mfset := L2_TBEs[address].mfset;
+    }
+  }
+
+  action(ee_sendAckToGetXRequestor, "ee", desc="Send ack from cache to GetX ID") {
+      enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_MSG_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(L2_TBEs[address].L1_WBAck_ID);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.Space := L2_TBEs[address].Space;
+        out_msg.RequestSize := L2_TBEs[address].RequestSize;
+        out_msg.memfetch := L2_TBEs[address].memfetch;
+      }
+  }
+
+  action(e_sendAtomicDataToGetXRequestor, "e_a", desc="Send atomic data from cache to GetX ID") {
+      enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_to_L1_DATA_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceResponseType:DATA_ATOMIC;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(L2_TBEs[address].L1_WBAck_ID);
+        out_msg.MessageSize := IntToMessageSizeType(L2_TBEs[address].RequestSize);
+        out_msg.Space := L2_TBEs[address].Space;
+        out_msg.RequestSize := L2_TBEs[address].RequestSize;
+        out_msg.memfetch := L2_TBEs[address].memfetch;
+      }
+  }
+
+  action(f_sendInvToSharersMinusRequestor, "f", desc="send invalidation to all sharers except the requestor") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       enqueue(L1RequestIntraChipL2Network_out, RequestMsg, latency="L2_to_L1_MSG_LATENCY") {
+         out_msg.Address := address;
+         out_msg.Type := CoherenceRequestType:INV;
+         out_msg.Requestor := machineID;
+         assert(L2DirectoryMemory[address].Sharers.count() > 0);
+         out_msg.Destination := L2DirectoryMemory[address].Sharers;
+         out_msg.Destination.remove(in_msg.Requestor);
+         out_msg.MessageSize := MessageSizeType:Request_Control;
+       }
+    }
+  }
+
+  action(fa_sendRecallToAllSharers, "fa", desc="send invalidation to all sharers") {
+    enqueue(L1RequestIntraChipL2Network_out, RequestMsg, latency="L2_to_L1_MSG_LATENCY") {
+      out_msg.Address := address;
+      out_msg.Type := CoherenceRequestType:RECALL;
+      out_msg.Requestor := machineID;
+      assert(L2DirectoryMemory[address].Sharers.count() > 0);
+      out_msg.Destination := L2DirectoryMemory[address].Sharers;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+    }
+  }
+
+  action(nn_addSharer, "\n", desc="Add L1 sharer to list") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       addSharer(address, in_msg.Requestor);
+     }
+   }
+
+  action(nx_addGetXSharer, "\nx", desc="Add GetX Id sharer to list") {
+     assert(L2_TBEs.isPresent(address));
+     addSharer(address, L2_TBEs[address].L1_WBAck_ID);
+  }
+
+  // OTHER ACTIONS
+  action(i_allocateTBE, "i", desc="Allocate TBE from L1 request queue") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       check_allocate(L2_TBEs);
+       L2_TBEs.allocate(address);
+       L2_TBEs[address].L1_GetS_IDs.clear();
+
+       assert(isL2CacheTagPresent(address) == true);
+       L2_TBEs[address].DataBlk := L2cacheMemory[address].DataBlk;
+       L2_TBEs[address].Dirty := L2cacheMemory[address].Dirty;
+
+       L2_TBEs[address].Space := in_msg.Space;
+       L2_TBEs[address].RequestSize := in_msg.RequestSize;
+       L2_TBEs[address].memfetch := in_msg.memfetch;
+       L2_TBEs[address].pendingAcks := getDirectoryEntry(address).Sharers.count();
+       if(L2DirectoryMemory[address].Sharers.isElement(in_msg.Requestor)){
+          L2_TBEs[address].pendingAcks := L2_TBEs[address].pendingAcks - 1;   // an invalidation is not sent to requester
+       }
+     }
+  }
+
+  action(ir_allocateTBE, "ir", desc="Allocate TBE for directory and L2 replacement") {
+    check_allocate(L2_TBEs);
+    L2_TBEs.allocate(address);
+    L2_TBEs[address].L1_GetS_IDs.clear();
+
+    assert(isL2CacheTagPresent(address) == true);
+    L2_TBEs[address].DataBlk := L2cacheMemory[address].DataBlk;
+    L2_TBEs[address].Dirty := L2cacheMemory[address].Dirty;
+
+    L2_TBEs[address].pendingAcks := getDirectoryEntry(address).Sharers.count();
+  }
+
+  action(irl_allocateTBE, "irl", desc="Allocate TBE for directory only replacement (no L2 data)") {
+    check_allocate(L2_TBEs);
+    L2_TBEs.allocate(address);
+    L2_TBEs[address].L1_GetS_IDs.clear();
+    L2_TBEs[address].pendingAcks := getDirectoryEntry(address).Sharers.count();
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+    L2_TBEs.deallocate(address);
+  }
+
+  action(jj_popL1RequestQueue, "\j", desc="Pop incoming L1 request queue") {
+    peek(L1RequestIntraChipL2Network_in,  RequestMsg) {
+       if(in_msg.Type == CoherenceRequestType:GETS) {
+          profileBandwidth("L1_MSG", in_msg.MessageSize);
+       } else if (in_msg.Type == CoherenceRequestType:DATA) {
+          profileBandwidth("L1_DATA", in_msg.MessageSize);
+       } else if (in_msg.Type == CoherenceRequestType:DATA_ATOMIC) {
+          profileBandwidth("L1_ATOMIC", in_msg.MessageSize);
+       } else {
+          error("Invalid CacheResponseType");
+       }
+    }
+    L1RequestIntraChipL2Network_in.dequeue();
+  }
+
+  action(q_updateAck, "q", desc="update pending invalidation ack count") {
+     peek(L1unblockNetwork_in, ResponseMsg) {
+       L2_TBEs[address].pendingAcks := L2_TBEs[address].pendingAcks - in_msg.AckCount;
+     }
+  }
+
+  action(ou_popUnblockQueue, "ou", desc="Pop incoming unblock queue") {
+     peek(L1unblockNetwork_in,  ResponseMsg) {
+       if(in_msg.Type == CoherenceResponseType:INV_ACK) {
+         profileBandwidth("L1_COHMSG_INVACK", in_msg.MessageSize);
+       } else if(in_msg.Type == CoherenceResponseType:RECALL_ACK) {
+         profileBandwidth("L1_COHMSG_RCLACK", in_msg.MessageSize);
+       } else {
+         error("Invalid response received");
+       }
+     }
+     L1unblockNetwork_in.dequeue();
+  }
+
+
+  action(o_popIncomingResponseQueue, "o", desc="Pop Incoming Response queue") {
+      memQueue_in.dequeue();
+  }
+  
+  action(m_writeDataToCache, "m", desc="Write data from mem response queue to cache") {
+    peek(memQueue_in, MemoryMsg) {
+      assert(isL2CacheTagPresent(address) == true);
+      L2cacheMemory[address].DataBlk := in_msg.DataBlk;
+      L2cacheMemory[address].Dirty := false;
+    }
+  }
+
+  action(mr_writeDataToCacheFromRequest, "mr", desc="Write data from L1 request queue to cache") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      assert(in_msg.Dirty == true);
+      assert(isL2CacheTagPresent(address) == true);
+      L2cacheMemory[address].DataBlk := in_msg.DataBlk;
+      L2cacheMemory[address].Dirty := in_msg.Dirty;
+    }
+  }
+
+  action(mt_writeDataToCacheFromTBE, "mt", desc="Write data from TBE to cache (for WB stores)") {
+    assert(L2_TBEs[address].Dirty == true);
+    assert(isL2CacheTagPresent(address) == true);
+    L2cacheMemory[address].DataBlk := L2_TBEs[address].DataBlk;
+    L2cacheMemory[address].Dirty := L2_TBEs[address].Dirty;
+  }
+
+  action(ss_recordGetSL1ID, "\s", desc="Record L1 GetS for load response") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      assert(L2_TBEs[address].Space == in_msg.Space);
+      L2_TBEs[address].L1_GetS_IDs.add(in_msg.Requestor);
+      L2_TBEs[address].mfset.insert(in_msg.Requestor, in_msg.memfetch);
+      L2_TBEs[address].RequestSize := getIntMax(L2_TBEs[address].RequestSize, in_msg.RequestSize);   // set size to max of all merged GetS
+    }
+  }
+  
+  action(set_setMRU, "\set", desc="set the MRU entry for both directory and cache") {
+    L2DirectoryMemory.setMRU(address);
+    assert(isL2CacheTagPresent(address) == true);
+    L2cacheMemory.setMRU(address);
+  }
+
+  action(qq_allocateDirectoryCacheBlock, "\q", desc="Allocate directory entry and set tag") {
+    if (L2DirectoryMemory.isTagPresent(address) == false) {
+      L2DirectoryMemory.allocate(address);
+    }
+  }
+
+  action(ql_allocateL2CacheBlock, "\ql", desc="Allocate L2 entry and set tag") {
+    if (L2cacheMemory.isTagPresent(address) == false) {
+      L2cacheMemory.allocate(address);
+    }
+  }
+
+  action(d_markBlockDirty, "d", desc="Mark block as dirty") {
+     assert(isL2CacheTagPresent(address) == true);
+     L2cacheMemory[address].Dirty := true;
+  }
+
+  action(rr_deallocateDirectoryCacheBlock, "\r", desc="Deallocate directory block, allowing a replacement in parallel with a fetch.") {
+    L2DirectoryMemory.deallocate(address);
+  }
+
+  action(rl_deallocateL2CacheBlock, "\rl", desc="Deallocate L2 block, allowing a replacement in parallel with a fetch.") {
+    L2cacheMemory.deallocate(address);
+  }
+
+  action(xx_recordGetXL1ID, "\x", desc="Record L1 WB for store response") {
+     DEBUG_EXPR(address);
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      L2_TBEs[address].L1_WBAck_ID := in_msg.Requestor;
+    }
+    DEBUG_EXPR(address);
+  }
+
+  action(ll_clearSharers, "\l", desc="Remove all L1 sharers from list") {
+      assert(L2DirectoryMemory.isTagPresent(address) == true);
+      L2DirectoryMemory[address].Sharers.clear();
+  }
+
+  action(zz_recycleL1RequestQueue, "zz", desc="recycle L1 request queue") {
+    L1RequestIntraChipL2Network_in.recycle();
+  }
+
+  action(zc_recycleL1ResponseNetwork, "zc", desc="recycle L1 response queue") {
+     L1RequestIntraChipL2Network_in.recycle();
+  }
+
+  action(z_stall, "z", desc="stall - i.e. do nothing") {
+  }
+
+
+
+  action(pM_profileRequestMiss, "prM", desc="Profile a demand miss for request message") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       profile_L2Cache_request_g(convertRequestToGenericType(in_msg.Type), in_msg.MessageSize, id, true);   // miss
+    }
+  }
+
+  action(pH_profileRequestHit, "prH", desc="Profile a demand hit for request message") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       profile_L2Cache_request_g(convertRequestToGenericType(in_msg.Type), in_msg.MessageSize, id, false);  // hit
+    }
+  }
+
+
+  action(pM_profileResponseMiss, "pwM", desc="Profile a demand miss for response message") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       profile_L2Cache_request_g(convertRequestToGenericType(in_msg.Type), in_msg.MessageSize, id, true);   // miss
+    }
+  }
+
+  action(pH_profileResponseHit, "pwH", desc="Profile a demand hit for response message") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       profile_L2Cache_request_g(convertRequestToGenericType(in_msg.Type), in_msg.MessageSize, id, false);  // hit
+    }
+  }
+
+
+  //*****************************************************
+  // TRANSITIONS
+  //*****************************************************
+
+
+  //===============================================
+  // BASE STATE - I
+
+  // Transitions from I (Idle)
+  transition(NP, {L1_GETS},  ISS) {
+    pM_profileRequestMiss;
+    qq_allocateDirectoryCacheBlock;
+    ql_allocateL2CacheBlock;
+    i_allocateTBE;
+    ss_recordGetSL1ID;
+    nn_addSharer;
+    a_issueFetchToMemory;
+    jj_popL1RequestQueue;
+  }
+
+  transition(NP, WB_Data,  IM) {
+    pM_profileResponseMiss;
+    qq_allocateDirectoryCacheBlock;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    jj_popL1RequestQueue;
+  }
+
+  transition(NP, L2_Atomic,  IMA) {
+    pM_profileResponseMiss;
+    qq_allocateDirectoryCacheBlock;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    jj_popL1RequestQueue;
+  }
+
+  // Transitions from S_D or SS_D (directory entry exists but no L2 data)
+  transition({S_D,SS_D}, {L1_GETS},  ISS) {
+    pM_profileRequestMiss;
+    ql_allocateL2CacheBlock;
+    i_allocateTBE;
+    ss_recordGetSL1ID;
+    set_setMRU;
+    nn_addSharer;
+    a_issueFetchToMemory;
+    jj_popL1RequestQueue;
+  }
+
+  // Write to block with no sharers and no data, fetch data from memory
+  transition(S_D, WB_Data,  IM) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    jj_popL1RequestQueue;
+  }
+
+  // Atomic to block with no sharers and no data, fetch data from memory
+  transition(S_D, L2_Atomic,  IMA) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    jj_popL1RequestQueue;
+  }
+
+  // Private write to block with 1 sharer and no data, fetch data from memory
+  transition(SS_D, WB_Data_Priv,  IDM) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    jj_popL1RequestQueue;
+  }
+
+  // Private atomic to block with 1 sharer and no data, fetch data from memory
+  transition(SS_D, L2_Atomic_Priv,  IMA) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    ll_clearSharers;
+    jj_popL1RequestQueue;
+  }
+
+
+  // Write to block with sharers and no data, send invalidations and fetch data from memory
+  transition(SS_D, WB_Data,  SDM) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    f_sendInvToSharersMinusRequestor;
+    jj_popL1RequestQueue;
+  }
+
+  // Atomic to block with sharers and no data, send invalidations and fetch data from memory
+  transition(SS_D, L2_Atomic,  SDMA) {
+    pM_profileResponseMiss;
+    ql_allocateL2CacheBlock;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    f_sendInvToSharersMinusRequestor;
+    jj_popL1RequestQueue;
+  }
+
+
+  transition(ISS, {L1_GETS}) {
+    pH_profileRequestHit;
+    ss_recordGetSL1ID;
+    nn_addSharer;
+    jj_popL1RequestQueue;
+  }
+
+  transition(ISS, Mem_Data, SS) {
+    m_writeDataToCache;
+    e_sendDataToGetSRequestors;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(ISS, {WB_Data, L2_Atomic}) {
+     //zc_recycleL1ResponseNetwork;
+     z_stall;
+  }
+
+  // transitions from IM and IMA
+  transition(IM, Mem_Data, S) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    ee_sendAckToGetXRequestor;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(IDM, Mem_Data, SS) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    ee_sendAckToGetXRequestor;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(IMA, Mem_Data, S) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    e_sendAtomicDataToGetXRequestor;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition({ISS, IM, IDM, IMA, SM, SMA, SDM, SDMA, MI, II}, {Dir_Replacement, Dir_Replacement_clean}) {
+    // Do nothing
+    z_stall;
+  }
+
+  transition({ISS, IM, IDM, IMA, SM, SMA, SDM, SDMA, MI, II}, {L2_Replacement, L2_Replacement_clean}) {
+    // Do nothing
+    z_stall;
+  }
+
+  transition({IM, IDM, IMA, SM, SMA, SDM, SDMA, MI, II}, {L1_GETS, WB_Data, L2_Atomic}) {
+     z_stall;
+  }
+
+  // transitions from S
+   transition(S, L1_GETS, SS) {
+     pH_profileRequestHit;
+     ds_sendDataToRequestor;
+     set_setMRU;
+     nn_addSharer;
+     jj_popL1RequestQueue;
+   }
+
+   // Got a write request to unshared data. No need to send invalidations
+   transition(S, WB_Data) {
+     pH_profileResponseHit;
+     d_markBlockDirty;
+     set_setMRU;
+     de_sendAckToRequestor;
+     mr_writeDataToCacheFromRequest;
+     jj_popL1RequestQueue;
+   }
+
+   // Got an atomic request to unshared data. No need to send invalidations
+   transition(S, L2_Atomic) {
+     pH_profileResponseHit;
+     d_markBlockDirty;
+     set_setMRU;
+     ds_sendAtomicDataToRequestor;
+     mr_writeDataToCacheFromRequest;
+     jj_popL1RequestQueue;
+   }
+
+
+  // transitions from SS
+  transition(SS, L1_GETS) {
+    pH_profileRequestHit;
+    ds_sendDataToRequestor;
+    set_setMRU;
+    nn_addSharer;
+    jj_popL1RequestQueue;
+  }
+
+  // Got a write request to shared data. Send invalidations
+  transition(SS, WB_Data, SM) {
+    pH_profileResponseHit;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    f_sendInvToSharersMinusRequestor;
+    jj_popL1RequestQueue;
+  }
+
+  // Got a write request to private data, no need to invalidate
+  transition(SS, WB_Data_Priv) {
+    pH_profileResponseHit;
+    d_markBlockDirty;
+    set_setMRU;
+    de_sendAckToRequestor;
+    mr_writeDataToCacheFromRequest;
+    jj_popL1RequestQueue;
+  }
+
+  // Got an atomic request to shared data. Send invalidations
+  transition(SS, L2_Atomic, SMA) {
+    pH_profileResponseHit;
+    d_markBlockDirty;
+    set_setMRU;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    f_sendInvToSharersMinusRequestor;
+    jj_popL1RequestQueue;
+  }
+
+  // Got an atomic request to private data, no need to send invalidation
+  // Note that the L1 that sent the atomic would have self-invalidated anyways
+  transition(SS, L2_Atomic_Priv, S) {
+    pH_profileResponseHit;
+    d_markBlockDirty;
+    set_setMRU;
+    ds_sendAtomicDataToRequestor;
+    mr_writeDataToCacheFromRequest;
+    ll_clearSharers;
+    jj_popL1RequestQueue;
+  }
+
+
+  // Received invalidation ack for write/atomic but there are acks still pending
+  transition({SM, SMA, SDM, SDMA}, Inv_Ack) {
+    q_updateAck;
+    ou_popUnblockQueue;
+  }
+
+  // Received all invalidation acks for write request
+  transition(SM, Inv_Ack_All, SS) {
+    ee_sendAckToGetXRequestor;
+    mt_writeDataToCacheFromTBE;
+    ll_clearSharers;
+    nx_addGetXSharer;    // note: requester may not be a sharer (write miss), but we'll be conservative
+    s_deallocateTBE;
+    ou_popUnblockQueue;
+  }
+
+  // Received all invalidation acks for atomic request
+  transition(SMA, Inv_Ack_All, S) {
+    e_sendAtomicDataToGetXRequestor;
+    mt_writeDataToCacheFromTBE;
+    ll_clearSharers;    // for atomics the requester self-invalidates so it's not a sharer anyways
+    s_deallocateTBE;
+    ou_popUnblockQueue;
+  }
+
+
+  // Received all invalidation acks for write request, but haven't received data from memory yet
+  transition(SDM, Inv_Ack_All, IDM) {
+    ll_clearSharers;
+    nx_addGetXSharer;    // note: requester may not be a sharer (write miss), but we'll be conservative
+    ou_popUnblockQueue;
+  }
+
+  // Received all invalidation acks for atomic request, but haven't received data from memory yet
+  transition(SDMA, Inv_Ack_All, IMA) {
+    ll_clearSharers;    // for atomics the requester self-invalidates so it's not a sharer anyways
+    ou_popUnblockQueue;
+  }
+
+  // Received data from memory for write, but haven't received all invalidation acks yet
+  transition(SDM, Mem_Data, SM) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  // Received data from memory for atomic, but haven't received all invalidation acks yet
+  transition(SDMA, Mem_Data, SMA) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  // Need to replace directory entry and clean data with no sharers, drop data
+  transition(S, {Dir_Replacement_clean}, NP) {
+     rl_deallocateL2CacheBlock;
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace directory entry with no data
+  transition(S_D, {Dir_Replacement_nodata}, NP) {
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace directory entry and dirty data with no sharers, send data to memory
+  transition(S, {Dir_Replacement}, NP) {
+     c_exclusiveReplacement;
+     rl_deallocateL2CacheBlock;
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace directory entry and clean data with sharers, send invalidations out
+  transition(SS, {Dir_Replacement_clean}, II) {
+     ir_allocateTBE;
+     fa_sendRecallToAllSharers;
+     ll_clearSharers;
+     rl_deallocateL2CacheBlock;
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace directory entry and no data but with sharers, send invalidations out
+  transition(SS_D, {Dir_Replacement_nodata}, II) {
+     irl_allocateTBE;
+     fa_sendRecallToAllSharers;
+     ll_clearSharers;
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace directory entry and dirty data with sharers, send invalidations out
+  transition(SS, {Dir_Replacement}, MI) {
+     ir_allocateTBE;
+     fa_sendRecallToAllSharers;
+     ll_clearSharers;
+     rl_deallocateL2CacheBlock;
+     rr_deallocateDirectoryCacheBlock;
+  }
+
+  // Need to replace L2 dirty data, send data to memory
+  transition(S, L2_Replacement, S_D) {
+     c_exclusiveReplacement;
+     rl_deallocateL2CacheBlock;
+  }
+
+  // Need to replace L2 dirty data, send data to memory
+  transition(SS, L2_Replacement, SS_D) {
+     c_exclusiveReplacement;
+     rl_deallocateL2CacheBlock;
+  }
+
+  // Need to replace L2 clean data
+  transition(S, L2_Replacement_clean, S_D) {
+     rl_deallocateL2CacheBlock;
+  }
+
+  // Need to replace L2 clean data
+  transition(SS, L2_Replacement_clean, SS_D) {
+     rl_deallocateL2CacheBlock;
+  }
+
+  // Received all acks for L2 replacement of dirty data, send data to memory
+  transition(MI, Inv_Ack_All, NP) {
+     c_exclusiveReplacementTBE;
+     s_deallocateTBE;
+     ou_popUnblockQueue;
+  }
+
+  // Received all acks for L2 replacment of clean data, drop data
+  transition(II, Inv_Ack_All, NP) {
+     s_deallocateTBE;
+     ou_popUnblockQueue;
+  }
+
+  // Received invalidation ack for L2 replacement but there are acks still pending
+  transition({MI, II}, Inv_Ack) {
+    q_updateAck;
+    ou_popUnblockQueue;
+  }
+
+  // Got a Priv write/atomic request in a transient state
+  // This likely means that we received a request from an L1 we are trying to invalidate (who was a private sharer)
+  transition({ISS, SM, SMA, SDM, SDMA, IDM, MI, II}, {WB_Data_Priv, L2_Atomic_Priv}) {
+     z_stall;
+  }
+}
+

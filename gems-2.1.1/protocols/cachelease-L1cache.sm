@@ -1,0 +1,632 @@
+
+/*
+    Copyright (C) 1999-2005 by Mark D. Hill and David A. Wood for the
+    Wisconsin Multifacet Project.  Contact: gems@cs.wisc.edu
+    http://www.cs.wisc.edu/gems/
+
+    --------------------------------------------------------------------
+
+    This file is part of the SLICC (Specification Language for
+    Implementing Cache Coherence), a component of the Multifacet GEMS
+    (General Execution-driven Multiprocessor Simulator) software
+    toolset originally developed at the University of Wisconsin-Madison.
+                                                                                
+    SLICC was originally developed by Milo Martin with substantial
+    contributions from Daniel Sorin.
+
+    Substantial further development of Multifacet GEMS at the
+    University of Wisconsin was performed by Alaa Alameldeen, Brad
+    Beckmann, Jayaram Bobba, Ross Dickson, Dan Gibson, Pacia Harper,
+    Derek Hower, Milo Martin, Michael Marty, Carl Mauer, Michelle Moravan,
+    Kevin Moore, Manoj Plakal, Daniel Sorin, Haris Volos, Min Xu, and Luke Yen.
+
+    --------------------------------------------------------------------
+
+    If your use of this software contributes to a published paper, we
+    request that you (1) cite our summary paper that appears on our
+    website (http://www.cs.wisc.edu/gems/) and (2) e-mail a citation
+    for your published paper to gems@cs.wisc.edu.
+
+    If you redistribute derivatives of this software, we request that
+    you notify us and either (1) ask people to register with us at our
+    website (http://www.cs.wisc.edu/gems/) or (2) collect registration
+    information and periodically send it to us.
+
+    --------------------------------------------------------------------
+
+    Multifacet GEMS is free software; you can redistribute it and/or
+    modify it under the terms of version 2 of the GNU General Public
+    License as published by the Free Software Foundation.
+
+    Multifacet GEMS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the Multifacet GEMS; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+    02111-1307, USA
+
+    The GNU General Public License is contained in the file LICENSE.
+
+### END HEADER ###
+*/
+/*
+ * $Id: MSI_MOSI_CMP_directory-L1cache.sm 1.10 05/01/19 15:55:40-06:00 beckmann@s0-28.cs.wisc.edu $
+ *
+ */
+
+
+machine(L1Cache, "Cache Leasing L1 Cache CMP") {
+
+  // NODE L1 CACHE
+  // From this node's L1 cache TO the network
+  // a local L1 -> this L2 bank, currently ordered with directory forwarded requests
+  MessageBuffer requestFromL1Cache, network="To", virtual_network="0", ordered="false";
+  MessageBuffer dataFromL1Cache, network="To", virtual_network="4", ordered="false";
+  
+  
+  // To this node's L1 cache FROM the network
+  // a L2 bank -> this L1
+  MessageBuffer responseToL1Cache, network="From", virtual_network="3", ordered="false";
+  
+  // STATES
+  enumeration(State, desc="Cache states", default="L1Cache_State_I") {
+    // Base states
+    I, desc="a L1 cache entry Idle";
+    SX, desc="a L1 cache entry Shared but whose lifetime has expired";
+    S, desc="a L1 cache entry Shared";
+
+    // Transient States
+    IS, desc="L1 idle, issued GETS, have not seen response yet";
+    MI, desc="Write evict sent, have not seen WB Ack yet";
+  }
+
+  // EVENTS
+  enumeration(Event, desc="Cache events") {
+    // L1 events
+    Load,            desc="Load request from the home processor";
+    Ifetch,          desc="I-fetch request from the home processor";
+    L1_WThru,        desc="Store request from the home processor";
+    
+    // internal generated request
+    L1_Replacement,  desc="L1 Replacement", format="!r";
+    L1_Expire,		 desc="L1 block lifetime expired", format="!r";
+
+
+    Data,       desc="Data for processor";
+    WB_Ack,       desc="WB Ack from L2";
+  }
+
+  // TYPES
+
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry" ) {
+    State CacheState,        desc="cache state";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false",   desc="data is dirty";
+    Time liveUntilTime,		 desc="lifetime of the cache block";
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Address Address,              desc="Physical address for this TBE";
+    State TBEState,        desc="Transient state";
+    DataBlock DataBlk,                desc="Buffer for the data block";
+    bool Dirty, default="false",   desc="data is dirty";
+    bool isPrefetch,       desc="Set if this was caused by a prefetch";
+    int pendingAcks, default="0", desc="number of pending acks";
+    MemorySpaceType Space,        desc="Memory space of request (GLOBAL, LOCAL)";
+  }
+
+  external_type(CacheMemory) {
+    bool cacheAvail(Address);
+    Address cacheProbe(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    Entry lookup(Address);
+    void changePermission(Address, AccessPermission);
+    bool isTagPresent(Address);
+  }
+
+  external_type(TBETable) {
+    TBE lookup(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    bool isPresent(Address);
+  }
+
+  TBETable L1_TBEs, template_hack="<L1Cache_TBE>";
+
+  CacheMemory L1IcacheMemory, template_hack="<L1Cache_Entry>", constructor_hack='L1_CACHE_NUM_SETS_BITS,L1_CACHE_ASSOC,MachineType_L1Cache,int_to_string(i)+"_L1I"', abstract_chip_ptr="true";
+  CacheMemory L1DcacheMemory, template_hack="<L1Cache_Entry>", constructor_hack='L1_CACHE_NUM_SETS_BITS,L1_CACHE_ASSOC,MachineType_L1Cache,int_to_string(i)+"_L1D"', abstract_chip_ptr="true";
+
+  MessageBuffer mandatoryQueue, ordered="false", rank="100", abstract_chip_ptr="true";
+
+  Sequencer sequencer, abstract_chip_ptr="true", constructor_hack="i";
+
+  int cache_state_to_int(State state);
+
+  Entry getL1CacheEntry(Address addr), return_by_ref="yes" {
+    if (L1DcacheMemory.isTagPresent(addr)) {
+      return L1DcacheMemory[addr];
+    } else if (L1IcacheMemory.isTagPresent(addr)) {
+      return L1IcacheMemory[addr];
+    } else {
+       DEBUG_EXPR(addr);
+       error("cannot get L1 entry, L1 block not present");
+    }
+  }
+
+  void changeL1Permission(Address addr, AccessPermission permission) {
+    if (L1DcacheMemory.isTagPresent(addr)) {
+      return L1DcacheMemory.changePermission(addr, permission);
+    } else if(L1IcacheMemory.isTagPresent(addr)) {
+      return L1IcacheMemory.changePermission(addr, permission);
+    } else {
+      error("cannot change permission, L1 block not present");
+    }
+  }
+
+  bool isL1CacheTagPresent(Address addr) {
+    return (L1DcacheMemory.isTagPresent(addr) || L1IcacheMemory.isTagPresent(addr));
+  }
+
+  bool isLive(Address addr) {
+	  return time_to_int(getL1CacheEntry(addr).liveUntilTime) >= time_to_int(get_time());
+  }
+
+  void setState(Address addr, State state) {
+    assert((L1DcacheMemory.isTagPresent(addr) && L1IcacheMemory.isTagPresent(addr)) == false);
+
+    // MUST CHANGE
+    if(L1_TBEs.isPresent(addr)) { 
+      L1_TBEs[addr].TBEState := state;
+    }
+
+    if (isL1CacheTagPresent(addr)) {
+      getL1CacheEntry(addr).CacheState := state;
+    
+      // Set permission  
+      if (state == State:I) {
+        changeL1Permission(addr, AccessPermission:Invalid);
+      } else if (state == State:S || state == State:SX) {
+        changeL1Permission(addr, AccessPermission:Read_Only);
+      } else {
+        changeL1Permission(addr, AccessPermission:Busy);
+      }
+    }
+  }
+
+  State getState(Address addr) {
+    if((L1DcacheMemory.isTagPresent(addr) && L1IcacheMemory.isTagPresent(addr)) == true){
+      DEBUG_EXPR(id);
+      DEBUG_EXPR(addr);
+    }
+    assert((L1DcacheMemory.isTagPresent(addr) && L1IcacheMemory.isTagPresent(addr)) == false);
+
+    if(L1_TBEs.isPresent(addr)) {
+      return L1_TBEs[addr].TBEState;
+    } else if (isL1CacheTagPresent(addr)) {
+      return getL1CacheEntry(addr).CacheState;
+    }
+    return State:I;
+  }
+
+  Event mandatory_request_type_to_event(CacheRequestType type) {
+    if (type == CacheRequestType:LD) {
+      return Event:Load;
+    } else if (type == CacheRequestType:IFETCH) {
+      return Event:Ifetch;
+    } else if ((type == CacheRequestType:ST) || (type == CacheRequestType:ATOMIC)) {
+      return Event:L1_WThru;
+    } else {
+      error("Invalid CacheRequestType");
+    }
+  }
+
+  bool is_write(CacheRequestType type) {
+     if ((type == CacheRequestType:ST) || (type == CacheRequestType:ATOMIC)) {
+        return true;
+     } else if( (type == CacheRequestType:IFETCH) || (type == CacheRequestType:LD) ) {
+        return false;
+     } else {
+        error("Invalid CacheRequestType");
+     }
+  }
+
+
+  out_port(requestIntraChipL1Network_out, RequestMsg, requestFromL1Cache);
+  out_port(dataIntraChipL1Network_out, ResponseMsg, dataFromL1Cache);
+
+  // Response IntraChip L1 Network - response msg to this L1 cache
+  in_port(responseIntraChipL1Network_in, ResponseMsg, responseToL1Cache) {
+    if (responseIntraChipL1Network_in.isReady()) {
+      peek(responseIntraChipL1Network_in, ResponseMsg) {
+
+           // Process the response from L2 cache
+           assert(in_msg.Destination.isElement(machineID));
+
+           // Always trigger expired state transitions before processing request
+           if(getState(in_msg.Address) == State:S && isLive(in_msg.Address) == false) {
+        	   trigger(Event:L1_Expire, in_msg.Address);
+           } else {
+
+               if(in_msg.Type == CoherenceResponseType:DATA) {
+                   trigger(Event:Data, in_msg.Address);
+               } else if(in_msg.Type == CoherenceResponseType:WB_ACK) {
+                  trigger(Event:WB_Ack, in_msg.Address);
+               } else {
+                 error("Invalid L1 response type");
+               }
+           }
+
+      }
+    }
+  }
+
+  // Mandatory Queue betweens Node's CPU and it's L1 caches
+  in_port(mandatoryQueue_in, CacheMsg, mandatoryQueue, desc="...") {
+    if (mandatoryQueue_in.isReady()) {
+      peek(mandatoryQueue_in, CacheMsg) {
+
+            // Received request from processor
+           // Process the request in L1 cache
+
+           // Always trigger expired state transitions before processing request
+           if(getState(in_msg.Address) == State:S && isLive(in_msg.Address) == false) {
+         	  trigger(Event:L1_Expire, in_msg.Address);
+           } else {
+
+               // Check for data access to blocks in I-cache and ifetchs to blocks in D-cache
+               if (in_msg.Type == CacheRequestType:IFETCH) {
+                 // ** INSTRUCTION ACCESS ***
+
+                 // Check to see if it is in the OTHER L1
+                 if (L1DcacheMemory.isTagPresent(in_msg.Address)) {
+                   // The block is in the wrong L1, put the request on the queue to the shared L2
+                   trigger(Event:L1_Replacement, in_msg.Address);
+                 }
+                 if (L1IcacheMemory.isTagPresent(in_msg.Address)) {
+                   // The tag matches for the L1, so the L1 asks the L2 for it.
+                   trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                 } else {
+                   if (L1IcacheMemory.cacheAvail(in_msg.Address)) {
+                     // L1 does't have the line, but we have space for it in the L1 so let's see if the L2 has it
+                     trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                   } else {
+                     // No room in the L1, so we need to make room in the L1
+                     // Always trigger expired state transitions before processing request
+                     if(getState(L1IcacheMemory.cacheProbe(in_msg.Address)) == State:S && isLive(L1IcacheMemory.cacheProbe(in_msg.Address)) == false) {
+                        trigger(Event:L1_Expire, L1IcacheMemory.cacheProbe(in_msg.Address));
+                     } else {
+                        // No room in the L1, so we need to make room in the L1
+                        trigger(Event:L1_Replacement, L1IcacheMemory.cacheProbe(in_msg.Address));
+                     }
+                   }
+                 }
+               } else {
+                 // *** DATA ACCESS ***
+
+                 // Check to see if it is in the OTHER L1
+                 if (L1IcacheMemory.isTagPresent(in_msg.Address)) {
+                   // The block is in the wrong L1, put the request on the queue to the shared L2
+                   trigger(Event:L1_Replacement, in_msg.Address);
+                 }
+
+                 if(is_write(in_msg.Type)) {
+                    // Write access, we don't care about L1 replacement, we're going to evict
+                    // the block if it's there, or write-through if it isn't
+                    trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                 } else {
+                    // Read access
+                    if (L1DcacheMemory.isTagPresent(in_msg.Address)) {
+                       // The tag matches for the L1, so the L1 ask the L2 for it
+                       trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                     } else {
+                       if (L1DcacheMemory.cacheAvail(in_msg.Address)) {
+                         // L1 does't have the line, but we have space for it in the L1 let's see if the L2 has it
+                         trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.Address);
+                       } else {
+                         // Always trigger expired state transitions before processing request
+                         if(getState(L1DcacheMemory.cacheProbe(in_msg.Address)) == State:S && isLive(L1DcacheMemory.cacheProbe(in_msg.Address)) == false) {
+                           trigger(Event:L1_Expire, L1DcacheMemory.cacheProbe(in_msg.Address));
+                         } else {
+                           // No room in the L1, so we need to make room in the L1
+                           trigger(Event:L1_Replacement, L1DcacheMemory.cacheProbe(in_msg.Address));
+                         }
+                       }
+                     }
+                 }
+               }
+
+           } // trigger L1_Expire first or not
+
+      }
+    }
+  }
+
+  // ACTIONS
+  action(a_issueGETS, "a", desc="Issue GETS") {
+    peek(mandatoryQueue_in, CacheMsg) {
+      enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_REQUEST_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+        DEBUG_EXPR(address);
+        DEBUG_EXPR(out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Space := in_msg.Space;
+      }
+    }
+  }
+
+  action(ai_issueGETINSTR, "ai", desc="Issue GETINSTR") {
+    peek(mandatoryQueue_in, CacheMsg) {    
+      enqueue(requestIntraChipL1Network_out, RequestMsg, latency="L1_REQUEST_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceRequestType:GET_INSTR;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+        DEBUG_EXPR(address);
+        DEBUG_EXPR(out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Space := in_msg.Space;
+      } 
+    }
+  }
+
+  action(f_sendDataToL2, "f", desc="send data to the L2 cache") {
+    peek(mandatoryQueue_in, CacheMsg) {
+       enqueue(dataIntraChipL1Network_out, ResponseMsg, latency="L1_RESPONSE_LATENCY") {
+         out_msg.Address := address;
+         out_msg.Type := CoherenceResponseType:DATA;
+         out_msg.DataBlk := getL1CacheEntry(address).DataBlk;
+         out_msg.Dirty := getL1CacheEntry(address).Dirty;
+         out_msg.Sender := machineID;
+         out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+         out_msg.MessageSize := MessageSizeType:Writeback_Data;
+         out_msg.Space := in_msg.Space;
+       }
+    }
+  }
+
+  action(d2t_sendDataToL2_fromTBE, "d2t", desc="send data to the L2 cache from TBE") {
+     peek(mandatoryQueue_in, CacheMsg) {
+       enqueue(dataIntraChipL1Network_out, ResponseMsg, latency="L1_REQUEST_LATENCY") {
+         out_msg.Address := address;
+         out_msg.Type := CoherenceResponseType:DATA;
+         out_msg.DataBlk := L1_TBEs[address].DataBlk;
+         out_msg.Dirty := L1_TBEs[address].Dirty;
+         out_msg.Sender := machineID;
+         out_msg.Destination.add(map_L1CacheMachId_to_L2Cache(address, machineID));
+         out_msg.MessageSize := MessageSizeType:Response_Data;
+         out_msg.Space := in_msg.Space;
+       }
+     }
+  }
+
+
+
+  action(h_load_hit, "h", desc="If not prefetch, notify sequencer the load completed.") {
+    DEBUG_EXPR(getL1CacheEntry(address).DataBlk);
+    sequencer.readCallback(address, getL1CacheEntry(address).DataBlk);
+  }
+
+  action(hh_store_hit, "\h", desc="If not prefetch, notify sequencer that store completed.") {
+    sequencer.writeCallback(address);
+  }
+
+  action(i_allocateTBE, "i", desc="Allocate TBE") {
+     peek(mandatoryQueue_in, CacheMsg) {
+       check_allocate(L1_TBEs);
+       L1_TBEs.allocate(address);
+       L1_TBEs[address].isPrefetch := false;
+       L1_TBEs[address].Dirty := getL1CacheEntry(address).Dirty;
+       L1_TBEs[address].DataBlk := getL1CacheEntry(address).DataBlk;
+       L1_TBEs[address].Space := in_msg.Space;
+     }
+  }
+
+  action(i_allocateStoreTBE, "is", desc="Allocate TBE for write-through store") {
+     peek(mandatoryQueue_in, CacheMsg) {
+       check_allocate(L1_TBEs);
+       L1_TBEs.allocate(address);
+       L1_TBEs[address].isPrefetch := false;
+       L1_TBEs[address].Dirty := true;
+       //L1_TBEs[address].DataBlk := getL1CacheEntry(address).DataBlk;
+       L1_TBEs[address].Space := in_msg.Space;
+     }
+  }
+
+  action(k_popMandatoryQueue, "k", desc="Pop mandatory queue.") {
+    mandatoryQueue_in.dequeue();
+  }
+
+  action(o_popIncomingResponseQueue, "o", desc="Pop Incoming Response queue and profile the delay within this virtual network") {
+    // Profile
+    peek(responseIntraChipL1Network_in, ResponseMsg) {
+      if(in_msg.Type == CoherenceResponseType:DATA) {
+         profileBandwidth("L2_DATA", in_msg.MessageSize);
+      } else if(in_msg.Type == CoherenceResponseType:WB_ACK) {
+         profileBandwidth("L2_MSG", in_msg.MessageSize);
+      } else {
+        error("Invalid L1 response type");
+      }
+    }
+
+    profileMsgDelay(3, responseIntraChipL1Network_in.dequeue_getDelayCycles());
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+    L1_TBEs.deallocate(address);
+  }
+
+  action(t_updateL1Lifetime, "t", desc="Update L1 block's lifetime from reponse msg") {
+    peek(responseIntraChipL1Network_in, ResponseMsg) {
+      getL1CacheEntry(address).liveUntilTime := in_msg.liveUntilTime;
+    }
+  }
+
+  action(u_writeDataToL1Cache, "u", desc="Write data to cache") {
+    peek(responseIntraChipL1Network_in, ResponseMsg) {
+      getL1CacheEntry(address).DataBlk := in_msg.DataBlk;
+      getL1CacheEntry(address).Dirty := false;
+    }
+  }
+
+  action(d_markBlockDirty, "d", desc="Mark block as dirty") {
+    peek(mandatoryQueue_in, CacheMsg) {
+       getL1CacheEntry(address).Dirty := true;
+    }
+  }
+
+  action(ff_deallocateL1CacheBlock, "\f", desc="Deallocate L1 cache block.  Sets the cache to not present, allowing a replacement in parallel with a fetch.") {
+    if (L1DcacheMemory.isTagPresent(address)) {
+      L1DcacheMemory.deallocate(address);
+    } else if(L1IcacheMemory.isTagPresent(address)) {
+      L1IcacheMemory.deallocate(address);
+    } else {
+       error("cannot deallocate, L1 block not present");
+    }
+  }
+
+  action(oo_allocateL1DCacheBlock, "\o", desc="Set L1 D-cache tag equal to tag of block B.") {
+    if (L1DcacheMemory.isTagPresent(address) == false) {
+      L1DcacheMemory.allocate(address);
+    }
+  }
+
+  action(pp_allocateL1ICacheBlock, "\p", desc="Set L1 I-cache tag equal to tag of block B.") {
+    if (L1IcacheMemory.isTagPresent(address) == false) {
+      L1IcacheMemory.allocate(address);
+    }
+  }
+
+  action(z_recycleMandatoryQueue, "\zz", desc="recycle L1 request queue") {
+    mandatoryQueue_in.recycle();
+  }
+
+  action(z_stall, "z", desc="stall - i.e. do nothing") {
+  }
+
+  action(pM_profileMiss, "pM", desc="Profile the demand miss. Only profiled once per unique request") {
+    peek(mandatoryQueue_in, CacheMsg) {
+      if(in_msg.profiled == false) {
+        profile_L1Cache_request_g(in_msg, id, true /*miss*/);
+      }
+    }
+  }
+
+  action(pR_profileRequest, "pR", desc="Profile the request. Only profiled once per unique request") {
+    peek(mandatoryQueue_in, CacheMsg) {
+       if(in_msg.profiled == false) {
+        profile_L1Cache_request_g(in_msg, id, false);
+      }
+    }
+  }
+
+
+  //*****************************************************
+  // TRANSITIONS
+  //*****************************************************
+
+  // Transitions from Idle
+  transition({I}, Load, IS) {
+    oo_allocateL1DCacheBlock;
+    i_allocateTBE;
+    a_issueGETS;
+    pM_profileMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition({I}, Ifetch, IS) {
+    pp_allocateL1ICacheBlock;
+    i_allocateTBE;
+    ai_issueGETINSTR;
+    pM_profileMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition({I}, L1_WThru, MI) {
+    i_allocateStoreTBE;
+    d2t_sendDataToL2_fromTBE;
+    pM_profileMiss;
+    k_popMandatoryQueue;
+  }
+
+  // Transitions from Shared-Expired
+  transition({SX}, Load, IS) {
+    i_allocateTBE;
+    a_issueGETS;
+    pM_profileMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition({SX}, Ifetch, IS) {
+    i_allocateTBE;
+    ai_issueGETINSTR;
+    pM_profileMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition(SX, {L1_WThru}, MI) {
+    i_allocateStoreTBE;
+    d_markBlockDirty;
+    f_sendDataToL2;
+    ff_deallocateL1CacheBlock;
+    pR_profileRequest;
+    k_popMandatoryQueue;
+  }
+
+  // Transitions from Shared
+  transition(S, {Load,Ifetch}) {
+    h_load_hit;
+    pR_profileRequest;
+    k_popMandatoryQueue;
+  }
+
+  transition(S, {L1_WThru}, MI) {
+    i_allocateStoreTBE;
+    d_markBlockDirty;
+    f_sendDataToL2;
+    ff_deallocateL1CacheBlock;
+    pR_profileRequest;
+    k_popMandatoryQueue;
+  }
+
+  transition({S, SX}, L1_Replacement, I) {
+    ff_deallocateL1CacheBlock;
+  }
+
+  transition({S}, L1_Expire, SX) {
+	  // Do nothing, simply change state
+  }
+
+  // Transitions from IS
+  transition(IS, L1_Replacement) {
+    z_recycleMandatoryQueue;
+  }
+
+  transition(IS, Data, S) {
+    u_writeDataToL1Cache;
+    t_updateL1Lifetime;
+    h_load_hit;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  // Transitions from MI
+  transition(MI, WB_Ack, I) {
+     hh_store_hit;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+  }
+}
+

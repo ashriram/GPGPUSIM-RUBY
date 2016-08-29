@@ -1,0 +1,788 @@
+
+/*
+    Copyright (C) 1999-2005 by Mark D. Hill and David A. Wood for the
+    Wisconsin Multifacet Project.  Contact: gems@cs.wisc.edu
+    http://www.cs.wisc.edu/gems/
+
+    --------------------------------------------------------------------
+
+    This file is part of the SLICC (Specification Language for
+    Implementing Cache Coherence), a component of the Multifacet GEMS
+    (General Execution-driven Multiprocessor Simulator) software
+    toolset originally developed at the University of Wisconsin-Madison.
+                                                                                
+    SLICC was originally developed by Milo Martin with substantial
+    contributions from Daniel Sorin.
+
+    Substantial further development of Multifacet GEMS at the
+    University of Wisconsin was performed by Alaa Alameldeen, Brad
+    Beckmann, Jayaram Bobba, Ross Dickson, Dan Gibson, Pacia Harper,
+    Derek Hower, Milo Martin, Michael Marty, Carl Mauer, Michelle Moravan,
+    Kevin Moore, Manoj Plakal, Daniel Sorin, Haris Volos, Min Xu, and Luke Yen.
+
+    --------------------------------------------------------------------
+
+    If your use of this software contributes to a published paper, we
+    request that you (1) cite our summary paper that appears on our
+    website (http://www.cs.wisc.edu/gems/) and (2) e-mail a citation
+    for your published paper to gems@cs.wisc.edu.
+
+    If you redistribute derivatives of this software, we request that
+    you notify us and either (1) ask people to register with us at our
+    website (http://www.cs.wisc.edu/gems/) or (2) collect registration
+    information and periodically send it to us.
+
+    --------------------------------------------------------------------
+
+    Multifacet GEMS is free software; you can redistribute it and/or
+    modify it under the terms of version 2 of the GNU General Public
+    License as published by the Free Software Foundation.
+
+    Multifacet GEMS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the Multifacet GEMS; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+    02111-1307, USA
+
+    The GNU General Public License is contained in the file LICENSE.
+
+### END HEADER ###
+*/
+/*
+ * $Id: MSI_MOSI_CMP_directory-L2cache.sm 1.12 05/01/19 15:55:40-06:00 beckmann@s0-28.cs.wisc.edu $
+ *
+ */
+
+machine(L2Cache, "Cache Leasing L2 Cache CMP") {
+
+  // L2 BANK QUEUES
+  // From local bank of L2 cache TO the network
+  MessageBuffer DirRequestFromL2Cache, network="To", virtual_network="2", ordered="false";  // this L2 bank -> Memory
+  MessageBuffer responseFromL2Cache, network="To", virtual_network="3", ordered="false";  // this L2 bank -> a local L1 || Memory
+
+  // FROM the network to this local bank of L2 cache
+  MessageBuffer L1RequestToL2Cache, network="From", virtual_network="0", ordered="false", vnet_type="request";  // a local L1 -> this L2 bank
+  MessageBuffer responseToL2Cache, network="From", virtual_network="3", ordered="false", vnet_type="response";  // Memory -> this L2 bank
+  MessageBuffer L1dataToL2Cache, network="From", virtual_network="4", ordered="false", vnet_type="response"; // L1 (WB_Data) -> this L2 bank
+
+  // STATES
+  enumeration(State, desc="L2 Cache states", default="L2Cache_State_NP") {
+    // Base states
+    NP, desc="Not present in cache";
+    SS, desc="L2 cache entry Clean, may be in some L1s";
+    SSX, desc="L2 cache entry Clean and guaranteed not to be in L1s";
+    M, desc="L2 cache entry Dirty, may be in some L1s", format="!b";
+    MX, desc="L2 cache entry Dirty and guaranteed not to be in L1s", format="!b";
+
+    // Transient States for fetching data from memory
+    ISS, desc="L2 idle, got L1_GETS, issued memory fetch, have not seen response yet";
+    IM, desc="L2 idle, got L1 Data, issued memory fetch, have not seen response(s) yet";
+    MI, desc="L2 replacement, issued memory write, have not seen ack yet";
+  }
+
+  // EVENTS
+  enumeration(Event, desc="L2 Cache events") {
+    // L2 events
+
+    // events initiated by the local L1s
+    L1_GET_INSTR,            desc="a L1I GET INSTR request for a block maped to us";
+    L1_GETS,                 desc="a L1D GETS request for a block maped to us";
+
+    // Store from L1
+    WB_Data,  desc="data from L1";
+
+    // Expiring event
+    L2_Expire,  desc="L2 block lifetime expired";
+
+    // events initiated by this L2
+    L2_Replacement,     desc="L2 Replacement", format="!r";
+    L2_Replacement_clean,     desc="L2 Replacement, but data is clean", format="!r";
+
+    // events from memory controller
+    Mem_Data,     desc="data from memory", format="!r";
+    Mem_Ack,     desc="ack from memory", format="!r";
+  }
+
+  // TYPES
+
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,          desc="cache state";
+    NetDest Sharers,               desc="tracks the L1 shares on-chip";
+    MachineID Exclusive,          desc="Exclusive holder of block";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false", desc="data is dirty";
+    Time liveUntilTime,		 desc="maximum lifetime of the cache block in any of the L1s";
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Address Address,            desc="Physical address for this TBE";
+    State TBEState,             desc="Transient state";
+    DataBlock DataBlk,          desc="Buffer for the data block";
+    bool Dirty, default="false", desc="Data is Dirty";
+
+    NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
+    MachineID L1_WBAck_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
+
+    bool isPrefetch,            desc="Set if this was caused by a prefetch";
+    MemorySpaceType Space,        desc="Memory space of request (GLOBAL, LOCAL)";
+  }
+
+  external_type(CacheMemory) {
+    bool cacheAvail(Address);
+    Address cacheProbe(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    Entry lookup(Address);
+    void changePermission(Address, AccessPermission);
+    bool isTagPresent(Address);
+    void setMRU(Address);
+  }
+
+  external_type(TBETable) {
+    TBE lookup(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    bool isPresent(Address);
+  }
+
+  TBETable L2_TBEs, template_hack="<L2Cache_TBE>";
+
+  CacheMemory L2cacheMemory, template_hack="<L2Cache_Entry>", constructor_hack='L2_CACHE_NUM_SETS_BITS,L2_CACHE_ASSOC,MachineType_L2Cache,int_to_string(i)';
+
+  // inclusive cache, returns L2 entries only
+  Entry getL2CacheEntry(Address addr), return_by_ref="yes" {
+    return L2cacheMemory[addr];
+  }
+  
+  void changeL2Permission(Address addr, AccessPermission permission) {
+    if (L2cacheMemory.isTagPresent(addr)) {
+      return L2cacheMemory.changePermission(addr, permission);
+    }
+  }
+
+  string getCoherenceRequestTypeStr(CoherenceRequestType type) {
+    return CoherenceRequestType_to_string(type);
+  }
+
+  bool isL2CacheTagPresent(Address addr) {
+    return (L2cacheMemory.isTagPresent(addr));
+  }
+
+  bool isLive(Address addr) {
+	  assert(isL2CacheTagPresent(addr));
+	  return time_to_int(getL2CacheEntry(addr).liveUntilTime) >= time_to_int(get_time());
+  }
+
+
+  State getState(Address addr) {
+    if(L2_TBEs.isPresent(addr)) { 
+      return L2_TBEs[addr].TBEState;
+    } else if (isL2CacheTagPresent(addr)) {
+      return getL2CacheEntry(addr).CacheState;
+    }
+    return State:NP;
+  }
+
+  string getStateStr(Address addr) {
+    return L2Cache_State_to_string(getState(addr));
+  }
+
+  // when is this called
+  void setState(Address addr, State state) {
+
+    // MUST CHANGE
+    if (L2_TBEs.isPresent(addr)) {
+      L2_TBEs[addr].TBEState := state;
+    }
+
+    if (isL2CacheTagPresent(addr)) {
+      getL2CacheEntry(addr).CacheState := state;
+    
+      // Set permission  
+      if (state == State:SS ) {
+        changeL2Permission(addr, AccessPermission:Read_Only);
+      } else if (state == State:M) {
+        changeL2Permission(addr, AccessPermission:Read_Write);
+      } else { 
+        changeL2Permission(addr, AccessPermission:Busy);
+      }
+    }
+  }
+
+  Event L1Cache_request_type_to_event(CoherenceRequestType type, Address addr, MachineID requestor) {
+    if(type == CoherenceRequestType:GETS) {
+      return Event:L1_GETS;
+    } else if(type == CoherenceRequestType:GET_INSTR) {
+      return Event:L1_GET_INSTR;
+    } else {
+      DEBUG_EXPR(addr);
+      DEBUG_EXPR(type);
+      error("Invalid L1 forwarded request type");
+    }
+  }
+
+  void addSharer(Address addr, MachineID requestor) {
+    assert(false);
+  }
+
+  bool isOneSharerLeft(Address addr, MachineID requestor) {
+    assert(false);
+    return false;
+  }
+
+  bool isSharer(Address addr, MachineID requestor) {
+     assert(false);
+     return false;
+  }
+
+  // ** OUT_PORTS **
+
+  out_port(DirRequestIntraChipL2Network_out, RequestMsg, DirRequestFromL2Cache);
+  out_port(responseIntraChipL2Network_out, ResponseMsg, responseFromL2Cache);
+
+
+  // Response IntraChip L2 Network - response msg to this particular L2 bank
+  in_port(L1responseIntraChipL2Network_in, ResponseMsg, L1dataToL2Cache) {
+    if (L1responseIntraChipL2Network_in.isReady()) {
+      peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+        // For L1 responses only
+        assert(in_msg.Destination.isElement(machineID));
+
+        // Always trigger expired state transitions before processing request
+        if( (getState(in_msg.Address) == State:SS || getState(in_msg.Address) == State:M)
+        		&& isLive(in_msg.Address) == false ) {
+     	   trigger(Event:L2_Expire, in_msg.Address);
+        } else {
+
+            if(in_msg.Type == CoherenceResponseType:DATA) {
+              // Need to allocate a block for this WB_Data
+              if (L2cacheMemory.isTagPresent(in_msg.Address)) {
+                // The L2 contains the block, so proceeded with handling the request
+                trigger(Event:WB_Data, in_msg.Address);
+              } else {
+                if (L2cacheMemory.cacheAvail(in_msg.Address)) {
+                  // L2 doesn't have the line, but we have space for it in the L2
+                  trigger(Event:WB_Data, in_msg.Address);
+                } else {
+                  // Always trigger expired state transitions before processing request
+                  if( (getState( L2cacheMemory.cacheProbe(in_msg.Address) ) == State:SS || getState( L2cacheMemory.cacheProbe(in_msg.Address) ) == State:M)
+                          && isLive( L2cacheMemory.cacheProbe(in_msg.Address) ) == false ) {
+                      trigger(Event:L2_Expire, L2cacheMemory.cacheProbe(in_msg.Address));
+                  } else {
+                      // No room in the L2, so we need to make room before handling the request
+                      if (L2cacheMemory[ L2cacheMemory.cacheProbe(in_msg.Address) ].Dirty ) {
+                        trigger(Event:L2_Replacement, L2cacheMemory.cacheProbe(in_msg.Address));
+                      } else {
+                        trigger(Event:L2_Replacement_clean, L2cacheMemory.cacheProbe(in_msg.Address));
+                      }
+                  }
+                }
+              }
+             } else {
+               error("unknown message type");
+             }
+        }  // trigger expire first or not
+      }  // if not ready, do nothing
+    }
+  }
+
+  // Response IntraChip L2 Network - response msg to this particular L2 bank
+  in_port(responseIntraChipL2Network_in, ResponseMsg, responseToL2Cache) {
+      if (responseIntraChipL2Network_in.isReady()) {
+        peek(responseIntraChipL2Network_in, ResponseMsg) {
+          // For memory responses only
+          assert(in_msg.Destination.isElement(machineID));
+
+          // Always trigger expired state transitions before processing request
+          if( (getState(in_msg.Address) == State:SS || getState(in_msg.Address) == State:M)
+          		&& isLive(in_msg.Address) == false ) {
+       	   trigger(Event:L2_Expire, in_msg.Address);
+          } else {
+
+              if(in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
+                // L2 now has data and all off-chip acks
+                trigger(Event:Mem_Data, in_msg.Address);  // L2 now has data and all off-chip acks
+              } else if(in_msg.Type == CoherenceResponseType:MEMORY_ACK) {
+                trigger(Event:Mem_Ack, in_msg.Address);  // L2 now has data and all off-chip acks
+              } else {
+                error("unknown message type");
+              }
+
+          }
+        }
+      }  // if not ready, do nothing
+    }
+
+  // L1 Request
+  in_port(L1RequestIntraChipL2Network_in, RequestMsg, L1RequestToL2Cache) {
+    if(L1RequestIntraChipL2Network_in.isReady()) {
+      peek(L1RequestIntraChipL2Network_in,  RequestMsg) {
+        DEBUG_EXPR(in_msg.Address);
+        DEBUG_EXPR(id);
+        DEBUG_EXPR(getState(in_msg.Address));
+        DEBUG_EXPR(in_msg.Requestor);
+        DEBUG_EXPR(in_msg.Type);
+        DEBUG_EXPR(in_msg.Destination);
+        assert(machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache);
+        assert(in_msg.Destination.isElement(machineID));
+
+        // Always trigger expired state transitions before processing request
+        if( (getState(in_msg.Address) == State:SS || getState(in_msg.Address) == State:M)
+        		&& isLive(in_msg.Address) == false ) {
+     	   trigger(Event:L2_Expire, in_msg.Address);
+        } else {
+
+            if (L2cacheMemory.isTagPresent(in_msg.Address)) {
+              // The L2 contains the block, so proceeded with handling the request
+              trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.Address, in_msg.Requestor), in_msg.Address);
+            } else {
+              if (L2cacheMemory.cacheAvail(in_msg.Address)) {
+                // L2 does't have the line, but we have space for it in the L2
+                trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.Address, in_msg.Requestor), in_msg.Address);
+              } else {
+
+                  // Always trigger expired state transitions before processing request
+                  if( (getState( L2cacheMemory.cacheProbe(in_msg.Address) ) == State:SS || getState( L2cacheMemory.cacheProbe(in_msg.Address) ) == State:M)
+                          && isLive( L2cacheMemory.cacheProbe(in_msg.Address) ) == false ) {
+                      trigger(Event:L2_Expire, L2cacheMemory.cacheProbe(in_msg.Address));
+                  } else {
+                      // No room in the L2, so we need to make room before handling the request
+                      if (L2cacheMemory[ L2cacheMemory.cacheProbe(in_msg.Address) ].Dirty ) {
+                        trigger(Event:L2_Replacement, L2cacheMemory.cacheProbe(in_msg.Address));
+                      } else {
+                        trigger(Event:L2_Replacement_clean, L2cacheMemory.cacheProbe(in_msg.Address));
+                      }
+                  }
+
+              }
+            }
+
+        }
+      }
+    }
+  }
+
+
+  // ACTIONS
+
+  action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      enqueue(DirRequestIntraChipL2Network_out, RequestMsg, latency="L2_REQUEST_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(map_Address_to_Directory(address));
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
+    }
+  }
+
+  action(a_issueFetchToMemoryForStore, "as", desc="fetch data from memory for store") {
+    peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+      enqueue(DirRequestIntraChipL2Network_out, RequestMsg, latency="L2_REQUEST_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(map_Address_to_Directory(address));
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
+    }
+  }
+
+  action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_RESPONSE_LATENCY") {
+      out_msg.Address := address;
+      out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(map_Address_to_Directory(address));
+      out_msg.DataBlk := getL2CacheEntry(address).DataBlk;
+      out_msg.Dirty := getL2CacheEntry(address).Dirty;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(ds_sendDataToRequestor, "ds", desc="Send data from cache to reqeustor") {
+      peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+    	assert(time_to_int(getL2CacheEntry(address).liveUntilTime) >= time_to_int(get_time()));
+        enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_RESPONSE_LATENCY") {
+          out_msg.Address := address;
+          out_msg.Type := CoherenceResponseType:DATA;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.DataBlk := getL2CacheEntry(address).DataBlk;
+          out_msg.Dirty := getL2CacheEntry(address).Dirty;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+          out_msg.AckCount := 0;
+          out_msg.Space := in_msg.Space;
+          out_msg.liveUntilTime := getL2CacheEntry(address).liveUntilTime;
+        }
+      }
+    }
+
+  action(de_sendAckToRequestor, "de", desc="Send WB Ack from cache to requestor") {
+     peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+      enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="L2_RESPONSE_LATENCY") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Sender);
+        DEBUG_EXPR(out_msg.Destination);
+        DEBUG_EXPR(out_msg.Address);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.Space := in_msg.Space;
+      }
+     }
+    }
+
+  action(e_sendDataToGetSRequestors, "e", desc="Send data from cache to all GetS IDs") {
+    assert(L2_TBEs[address].L1_GetS_IDs.count() > 0);
+    assert(time_to_int(getL2CacheEntry(address).liveUntilTime) >= time_to_int(get_time()));
+    enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="1") {
+      out_msg.Address := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination := L2_TBEs[address].L1_GetS_IDs;  // internal nodes
+      out_msg.DataBlk := getL2CacheEntry(address).DataBlk;
+      out_msg.Dirty := getL2CacheEntry(address).Dirty;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Space := L2_TBEs[address].Space;
+      out_msg.liveUntilTime := getL2CacheEntry(address).liveUntilTime;
+    }
+  }
+
+  action(ee_sendAckToGetXRequestor, "ee", desc="Send ack from cache to GetX ID") {
+      enqueue(responseIntraChipL2Network_out, ResponseMsg, latency="1") {
+        out_msg.Address := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(L2_TBEs[address].L1_WBAck_ID);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.Space := L2_TBEs[address].Space;
+      }
+    }
+
+  // OTHER ACTIONS
+  action(i_allocateTBE, "i", desc="Allocate TBE from L1 request queue") {
+     peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+       check_allocate(L2_TBEs);
+       L2_TBEs.allocate(address);
+       L2_TBEs[address].L1_GetS_IDs.clear();
+       L2_TBEs[address].DataBlk := getL2CacheEntry(address).DataBlk;
+       L2_TBEs[address].Dirty := getL2CacheEntry(address).Dirty;
+       L2_TBEs[address].Space := in_msg.Space;
+     }
+  }
+
+  action(il_allocateTBE, "il", desc="Allocate TBE from L1 response queue") {
+     peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+       check_allocate(L2_TBEs);
+       L2_TBEs.allocate(address);
+       L2_TBEs[address].L1_GetS_IDs.clear();
+       L2_TBEs[address].DataBlk := getL2CacheEntry(address).DataBlk;
+       L2_TBEs[address].Dirty := getL2CacheEntry(address).Dirty;
+       L2_TBEs[address].Space := in_msg.Space;
+     }
+  }
+
+  action(ir_allocateTBE, "ir", desc="Allocate TBE for L2 replacement") {
+    check_allocate(L2_TBEs);
+    L2_TBEs.allocate(address);
+    L2_TBEs[address].L1_GetS_IDs.clear();
+    L2_TBEs[address].DataBlk := getL2CacheEntry(address).DataBlk;
+    L2_TBEs[address].Dirty := getL2CacheEntry(address).Dirty;
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+    L2_TBEs.deallocate(address);
+  }
+
+  action(jj_popL1RequestQueue, "\j", desc="Pop incoming L1 request queue") {
+    peek(L1RequestIntraChipL2Network_in,  RequestMsg) {
+       profileBandwidth("L1_MSG", in_msg.MessageSize);
+    }
+    profileMsgDelay(0, L1RequestIntraChipL2Network_in.dequeue_getDelayCycles());
+  }
+
+
+  action(o_popIncomingResponseQueue, "o", desc="Pop Incoming Response queue") {
+    profileMsgDelay(3, responseIntraChipL2Network_in.dequeue_getDelayCycles());
+  }
+  action(o_popIncomingL1ResponseQueue, "ol", desc="Pop Incoming L1 Response queue") {
+    peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+       profileBandwidth("L1_DATA", in_msg.MessageSize);
+    }
+    profileMsgDelay(3, L1responseIntraChipL2Network_in.dequeue_getDelayCycles());
+  }
+
+  
+  action(m_writeDataToCache, "m", desc="Write data from mem response queue to cache") {
+    peek(responseIntraChipL2Network_in, ResponseMsg) {
+      getL2CacheEntry(address).DataBlk := in_msg.DataBlk;
+      getL2CacheEntry(address).Dirty := in_msg.Dirty;
+    }
+  }
+
+  action(mr_writeDataToCacheFromRequest, "mr", desc="Write data from L1 response queue to cache") {
+    peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+      assert(in_msg.Dirty == true);
+      getL2CacheEntry(address).DataBlk := in_msg.DataBlk;
+      getL2CacheEntry(address).Dirty := in_msg.Dirty;
+    }
+  }
+
+  action(mt_writeDataToCacheFromTBE, "mt", desc="Write data from TBE to cache (for WB stores)") {
+    assert(L2_TBEs[address].Dirty == true);
+    getL2CacheEntry(address).DataBlk := L2_TBEs[address].DataBlk;
+    getL2CacheEntry(address).Dirty := L2_TBEs[address].Dirty;
+  }
+
+  action(ss_recordGetSL1ID, "\s", desc="Record L1 GetS for load response") {
+    peek(L1RequestIntraChipL2Network_in, RequestMsg) {
+      assert(L2_TBEs[address].Space == in_msg.Space);
+      L2_TBEs[address].L1_GetS_IDs.add(in_msg.Requestor);
+    }
+  }
+  
+  action(set_setMRU, "\set", desc="set the MRU entry") {
+    L2cacheMemory.setMRU(address);
+  }
+
+  action(qq_allocateL2CacheBlock, "\q", desc="Set L2 cache tag equal to tag of block B.") {
+    if (L2cacheMemory.isTagPresent(address) == false) {
+      L2cacheMemory.allocate(address);
+    }
+  }
+
+  action(t_updateL2BlockTime, "t", desc="Extend the lifetime of the L2 block due to a read hit") {
+	 getL2CacheEntry(address).liveUntilTime := getTimePlusTime(CL_get_fixed_lease_delta(), get_time());
+  }
+
+  action(d_markBlockDirty, "d", desc="Mark block as dirty") {
+     getL2CacheEntry(address).Dirty := true;
+  }
+
+  action(rr_deallocateL2CacheBlock, "\r", desc="Deallocate L2 cache block.  Sets the cache to not present, allowing a replacement in parallel with a fetch.") {
+    L2cacheMemory.deallocate(address);
+  }
+
+  action(xx_recordGetXL1ID, "\x", desc="Record L1 WB for store response") {
+     DEBUG_EXPR(address);
+    peek(L1responseIntraChipL2Network_in, ResponseMsg) {
+      L2_TBEs[address].L1_WBAck_ID := in_msg.Sender;
+    }
+    DEBUG_EXPR(address);
+  }
+
+  action(zz_recycleL1RequestQueue, "zz", desc="recycle L1 request queue") {
+    L1RequestIntraChipL2Network_in.recycle();
+  }
+
+  action(zn_recycleResponseNetwork, "zn", desc="recycle memory response queue") {
+    responseIntraChipL2Network_in.recycle();
+  }
+
+  action(zc_recycleL1ResponseNetwork, "zc", desc="recycle L1 response queue") {
+    L1responseIntraChipL2Network_in.recycle();
+  }
+
+  action(z_stall, "z", desc="stall - i.e. do nothing") {
+  }
+
+
+  //*****************************************************
+  // TRANSITIONS
+  //*****************************************************
+
+
+  //===============================================
+  // BASE STATE - I
+
+  // Transitions from I (Idle)
+  transition(NP, {L1_GETS,L1_GET_INSTR},  ISS) {
+    qq_allocateL2CacheBlock;
+    i_allocateTBE;
+    ss_recordGetSL1ID;
+    a_issueFetchToMemory;
+    jj_popL1RequestQueue;
+  }
+
+  transition(NP, {WB_Data},  IM) {
+    qq_allocateL2CacheBlock;
+    d_markBlockDirty;
+    il_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemoryForStore;
+    o_popIncomingL1ResponseQueue;
+  }
+
+
+  // transitions from ISS
+  transition({ISS}, {L2_Replacement, L2_Replacement_clean}) {
+	  // Do nothing
+	  // We can't recycle queue because his event can be triggered from both request and response queue
+	  z_stall;
+  }
+
+  transition(ISS, {L1_GETS, L1_GET_INSTR}) {
+    ss_recordGetSL1ID;
+    jj_popL1RequestQueue;
+  }
+
+  transition(ISS, Mem_Data, SS) {
+    m_writeDataToCache;
+	t_updateL2BlockTime;
+    e_sendDataToGetSRequestors;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(ISS, WB_Data) {
+     zc_recycleL1ResponseNetwork;
+  }
+
+  // transitions from IM
+  transition(IM, Mem_Data, M) {
+    m_writeDataToCache;
+    mt_writeDataToCacheFromTBE;
+    ee_sendAckToGetXRequestor;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(IM, {L1_GETS, L1_GET_INSTR}) {
+    zz_recycleL1RequestQueue;
+  }
+
+  transition(IM, {L2_Replacement, L2_Replacement_clean}) {
+	  // Do nothing
+	  // We can't recycle queue because his event can be triggered from both request and response queue
+	  z_stall;
+  }
+
+  transition(IM, WB_Data) {
+     zc_recycleL1ResponseNetwork;
+  }
+
+
+  // transitions from SS
+  transition(SS, {L1_GETS, L1_GET_INSTR}) {
+	t_updateL2BlockTime;
+    ds_sendDataToRequestor;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+
+  transition(SS, WB_Data) {
+	zc_recycleL1ResponseNetwork
+  }
+  
+  transition(SS, {L2_Replacement_clean}) {
+	  // Do nothing
+	  // We can't recycle queue because his event can be triggered from both request and response queue
+	  z_stall;
+  }
+
+  transition(SS, L2_Expire, SSX) {
+	  // Do nothing, simply change state
+	  //z_stall;
+  }
+
+  // transitions from SSX
+  transition(SSX, {L1_GETS, L1_GET_INSTR}, SS) {
+	t_updateL2BlockTime;
+    ds_sendDataToRequestor;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+  transition(SSX, WB_Data, MX) {
+    de_sendAckToRequestor;
+    mr_writeDataToCacheFromRequest;
+    set_setMRU;
+    o_popIncomingL1ResponseQueue;
+  }
+
+  transition(SSX, {L2_Replacement_clean}, NP) {
+    rr_deallocateL2CacheBlock;
+  }
+
+
+
+  // transitions from M
+  transition(M, {L1_GETS, L1_GET_INSTR}) {
+	t_updateL2BlockTime;
+    ds_sendDataToRequestor;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+  transition(M, WB_Data) {
+	zc_recycleL1ResponseNetwork
+  }
+
+  transition(M, {L2_Replacement}) {
+    // Do nothing
+	// We can't recycle queue because his event can be triggered from both request and response queue
+	z_stall;
+  }
+
+  transition(M, L2_Expire, MX) {
+	  // Do nothing, simply change state
+	  //z_stall;
+  }
+
+  // Transitions from MX
+  transition(MX, {L1_GETS, L1_GET_INSTR}, M) {
+	t_updateL2BlockTime;
+    ds_sendDataToRequestor;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+  transition(MX, WB_Data) {
+    de_sendAckToRequestor;
+    mr_writeDataToCacheFromRequest;
+    set_setMRU;
+    o_popIncomingL1ResponseQueue;
+  }
+
+  transition(MX, {L2_Replacement}, MI) {
+    ir_allocateTBE;
+    c_exclusiveReplacement;
+    rr_deallocateL2CacheBlock;
+  }
+
+
+  // transitions from MI
+  transition(MI, {L1_GETS, L1_GET_INSTR}) {
+    zz_recycleL1RequestQueue;
+  }
+
+  transition(MI, {L2_Replacement, L2_Replacement_clean}) {
+	  // Do nothing
+	  // We can't recycle queue because his event can be triggered from both request and response queue
+	  z_stall;
+  }
+
+
+
+  transition(MI, WB_Data) {
+     zc_recycleL1ResponseNetwork;
+  }
+
+
+  transition(MI, Mem_Ack, NP) {
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+
+}
+

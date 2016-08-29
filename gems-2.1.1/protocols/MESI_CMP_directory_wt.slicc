@@ -1,0 +1,6 @@
+../protocols/MESI_CMP_directory_wt-msg.sm
+../protocols/MESI_CMP_directory_wt-L2cache.sm
+../protocols/MESI_CMP_directory_wt-L1cache.sm
+../protocols/MESI_CMP_directory_wt-mem.sm
+../protocols/standard_CMP-protocol.sm
+

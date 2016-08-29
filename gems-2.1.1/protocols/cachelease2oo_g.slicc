@@ -1,0 +1,6 @@
+../protocols/cachelease2oo-msg.sm
+../protocols/cachelease2oo-L2cache.sm
+../protocols/cachelease2oo-L1cache.sm
+../protocols/cachelease2oo_g-mem.sm
+../protocols/standard_CMP-protocol.sm
+
