@@ -9,14 +9,16 @@ This is the source code for GPGPU-Sim v3.1.2 with Ruby memory system which was u
 
 The process for compiling this version is identical to the process of compiling regular GPGPU-Sim. Read the README file for GPGPU-Sim v3.1.2 (file called README in the same directory as this file) for instructions on how to compile and run GPGPU-Sim. By default, the makefile builds the following Ruby protocols (see the HPCA 2013 paper for more details on these protocols).
 
-non_coherent_g          - No coherence. Also use for No L1s
-MESI_CMP_directory_g    - MESI
-VI_wt_g                 - GPU-VI, inclusive protocol
-VI_wt_ni_g              - GPU-VIni, non-inclusive protocol
-ideal_VI_wt_g           - Idealized write-through protocol
-cachelease3_g           - TC-Weak
-cachelease2_g           - TC-Strong
-cachelease2uo_g         - TC-Strong without optimizations proposed in HPCA 2013 paper
+| Protocol              |  Description                      |
+|:----------------------|:----------------------------------|
+|:non_coherent_g        |: No coherence. Also use for No L1s|
+|:MESI_CMP_directory_g  |: MESI|
+|:VI_wt_g               |: GPU-VI, inclusive protocol|
+|:VI_wt_ni_g            |: GPU-VIni, non-inclusive protocol|
+|:ideal_VI_wt_g         |: Idealized write-through protocol|
+|:cachelease3_g         |: TC-Weak|
+|:cachelease2_g         |: TC-Strong|
+|:cachelease2uo_g       |: TC-Strong without optimizations proposed in HPCA 2013 paper|
 
 
 *****************
